@@ -17,26 +17,79 @@ the art, HUD, Wi-Fi provisioning, firmware builds, flashing and OTA.
   date and temperatures centered and no border.
 * **Wi-Fi runtime transport:** live RGB565 artwork is delivered over TCP. USB is
   reserved for explicit firmware flashing and diagnostics.
-* **Working Push OTA:** builds the selected C firmware, releases USB cleanly, enters
-  BOOTSEL, copies the UF2 and resumes streaming. Network-only devices receive the
-  reboot command over TCP before the same UF2 copy.
+* **Push OTA control:** builds the selected C firmware, releases USB cleanly,
+  enters BOOTSEL and copies the UF2. USB flashing is verified; network-only OTA
+  requires an established Pico TCP session.
 * Optional **AI image mode** (rotating prompt template -> image API -> 400x240 RGB565).
+
+---
+
+## Current verified status (2026-08-01)
+
+### Verified
+
+* The Pico 2 W enumerates as **COM5**, USB VID `2E8A`. The attached ESP device
+  uses VID `303A` and is never selected by the flashing tools.
+* The safe firmware builds and flashes automatically:
+
+  ```powershell
+  python tools\build_firmware.py --mode 640x480 --invert-diffpairs 1 --clean --flash
+  ```
+
+* The firmware uses **640x480p60 DVI** with a **320x240 RGB565 framebuffer**
+  doubled horizontally and vertically. A frame payload is **153,600 bytes**.
+* The standalone [PicoDVIArtStudio.exe](PicoDVIArtStudio.exe) starts the native
+  GUI and TCP server. Because it is a PyInstaller one-file application, first
+  launch can take roughly 20-30 seconds while it extracts; the launcher and
+  application child appearing as two processes is normal. Current SHA-256:
+  `D6C7DC3A9D555E086A98641225135ECE0936B2C3498E7089749D1BFF5D0462C2`.
+* The server has been verified listening on `192.168.124.4:5001`.
+* Windows Firewall has exactly one enabled inbound rule named
+  **Pico DVI Art Server**, allowing TCP port `5001` on all profiles. The app
+  checks this rule whenever the server starts and requests one UAC approval if
+  it must create it.
+* Wi-Fi credentials are editable in the GUI's **Network** tab. Saving writes
+  only to the ignored local credentials file. **Build + flash firmware** is
+  required before changed credentials are present on the Pico.
+* `temp_source = weather` reads current outdoor temperature from Open-Meteo
+  without an API key. Clock/date come from the PC. The MCU temperature appears
+  only after a connected Pico sends `TEMP` telemetry.
+* All **80 automated tests** pass.
+
+### Still requiring physical verification
+
+* A sustained Pico-to-server TCP frame session was not observed in the final
+  test window. The Pico has alternated between successful association
+  (`192.168.124.7`) and AP refusal/backoff. An ARP entry proves the AP learned
+  the Pico, but failed ping alone does **not** prove client isolation because
+  the Pico firmware does not provide an ICMP/TCP test service.
+* The panel was reported as solid red. The documented Waveshare/PicoDVI wiring
+  uses `invert_diffpairs=1`; a test with `0` produced no useful firmware log and
+  was reverted. The current board therefore runs the documented
+  `invert_diffpairs=1` build. Confirm the panel shows the checkered
+  **PICO DVI ART** standby screen; if it remains solid red, inspect the DVI
+  carrier seating, cable/panel input, and power before changing networking.
 
 ---
 
 ## Run it — one file, no questions
 
-Double-click **`START.bat`**. That is the whole procedure.
+Double-click **`PicoDVIArtStudio.exe`** for the packaged application, or
+**`START.bat`** to run the source version through an installed Python.
 
-It finds Python (installing nothing you already have), installs the dependencies the
-first time, then opens the native **Pico DVI Art Studio**. The server runs inside the
-application; there is no browser, separate console server or port-selection step.
+`START.bat` finds Python, installs missing dependencies the first time, then
+opens the native **Pico DVI Art Studio**. The packaged EXE already contains the
+Python runtime and application dependencies. In both cases the server runs
+inside the application; there is no browser or separate console server.
 
 ```
+PicoDVIArtStudio.exe
+  └── native GUI + art server + provisioning + build/flash/OTA controls
+
 START.bat
   ├── finds Python 3.9+ (PATH, py launcher, or %LOCALAPPDATA%\Programs\Python)
   ├── pip install -r pc_server/requirements.txt mpremote pyserial   (first run only)
-  └── app/studio.py                 ← desktop UI + server + USB/Wi-Fi transport
+  └── app/studio.py                 ← same application, run from source
 ```
 
 Select `retro`, `shader`, `ai` or `hybrid` under **Art source**. The **Network** tab
@@ -82,14 +135,14 @@ GUI itself does not.
    |  1. InfiniteArtEngine        - swirling plasma, no repeat period
    |  2. SwirlBorder              - animated colour frame
    |  3. HUD                      - clock / date / OUT temp / MCU temp
-   |  4. RGB565 pack (192,000 B)
-   +--> TCP :5001 --- Wi-Fi ---> [ Pico W ]  pico_firmware/main.py
+   |  4. RGB565 pack (153,600 B at 320x240)
+   +--> TCP :5001 --- Wi-Fi ---> [ Pico 2 W ]  pico_firmware_c/main.c
                                      |  blits bytes into the DVI framebuffer
                                      |  sends TEMP / STAT / HELLO back up
                                      v
                             [ Pico DVI LCD 10.1 ]
 
-[ GitHub repo ] --raw version.json + *.py--> [ Pico W boot.py ] --flash--> reboot
+[ Desktop app ] --BOOTSEL + UF2--> [ Pico 2 W C firmware ] --reboot
 ```
 
 ### Wire protocol
@@ -105,7 +158,7 @@ Pico to server, newline-terminated ASCII:
 
 ```
 HELLO <fw_version> <device_id>
-TEMP <celsius>            # RP2040 on-chip sensor -> the "MCU" HUD line
+TEMP <celsius>            # RP2350 on-chip sensor -> the "MCU" HUD line
 STAT fps=<f> drops=<n>
 ```
 
@@ -149,7 +202,10 @@ Want it calmer or wilder? `--speed 0.4` slows every visual cycle by 2.5x,
 
 ```
 pico-dvi-art-server/
-├── START.bat                # ← the only file you run. Everything else is internal.
+├── PicoDVIArtStudio.exe     # packaged native application
+├── START.bat                # source launcher (requires Python)
+├── app/
+│   └── studio.py            # GUI + server owner + provisioning/flash/OTA controls
 ├── .github/workflows/
 │   ├── release.yml          # auto-increments pico_firmware/version.json on push
 │   └── ci.yml               # tests + firmware byte-compile
@@ -223,29 +279,21 @@ frame it received to PNG - what you see there is exactly what the panel shows.
 
 ---
 
-## 2. Flash the Pico W (automatic)
+## 2. Flash the Pico 2 W (automatic)
 
-`START.bat` does this for you — see [Run it](#run-it--one-file-no-questions) above.
-The manual route below is only for when you want to do it by hand.
+Use **Build + flash firmware** in the GUI. It saves the settings, builds the
+safe C/PicoDVI firmware, asks only Raspberry Pi VID `2E8A` to enter BOOTSEL,
+copies the UF2, and waits for the board to reboot.
 
-1. Install MicroPython for the Pico W, then create your credentials file:
+The equivalent command is:
 
-   ```powershell
-   copy pico_firmware\device_secrets.example.py pico_firmware\device_secrets.py
-   ```
+```powershell
+python tools\build_firmware.py --mode 640x480 --invert-diffpairs 1 --clean --flash
+```
 
-   Edit it with your `WIFI_SSID`, `WIFI_PASS`, `SERVER_IP` and `GITHUB_*` values.
-   **It is git-ignored** — this repo has to be public for raw OTA to work, so the
-   password must never be committed. `config.py` reads it and falls back to harmless
-   placeholders when it is absent.
-2. Copy `boot.py`, `main.py`, `ota.py`, `display_driver.py`, `config.py`,
-   `device_secrets.py` and `version.json` to the board (Thonny, or
-   `mpremote cp pico_firmware/*.py :` — skip the `.example` file).
-3. Power the board from any USB adapter next to the panel.
-
-On boot it joins Wi-Fi, checks GitHub for a newer firmware version, then connects to
-the server and starts blitting frames. If the server is down it shows a local fallback
-animation and keeps retrying, so the panel is never blank.
+The board shows a local checkered standby/status screen while Wi-Fi or the
+server is unavailable and keeps retrying. USB remains for explicit
+installation/recovery only; live art frames use Wi-Fi.
 
 ### Display backends
 
@@ -332,7 +380,7 @@ call never stalls the stream, the shader simply keeps running. Set
 | HUD line | Source                                                                        |
 | -------- | ----------------------------------------------------------------------------- |
 | `OUT`    | server side: Open-Meteo current temperature (default), host CPU, or a constant |
-| `MCU`    | the Pico's own RP2040 on-chip sensor (ADC4), sent up the stream every 5 s      |
+| `MCU`    | the Pico's own RP2350 on-chip sensor (ADC4), sent up the stream every 5 s      |
 
 ```json
 { "temp_source": "weather", "latitude": 51.2194, "longitude": 4.4025 }
@@ -351,13 +399,9 @@ python -m unittest discover -s tests -v
 python pc_server/server.py --self-test 60
 ```
 
-28 tests cover the font metrics, RGB565 packing in both byte orders, shader
-determinism and non-repetition, the border geometry, HUD placement, config coercion,
-prompt rotation, and a full socket round-trip including telemetry.
-
-A further 10 tests run the firmware's OTA module on desktop Python with `machine`,
-`urequests` and `config` stubbed, proving that a failed download, an HTML 404 page or
-a firmware that never boots all leave the device on its previous working version.
+The current suite contains **80 tests** covering font metrics, RGB565 packing,
+shader and retro-scene behavior, border/HUD placement, configuration, prompt
+rotation, socket framing/telemetry, and OTA staging/rollback failure cases.
 
 ---
 
@@ -365,8 +409,8 @@ a firmware that never boots all leave the device on its previous working version
 
 * Rendering costs ~25 ms/frame at 400x240 on a modern desktop CPU (~40 fps headroom);
   the border precomputes its geometry once and only touches edge pixels.
-* Each frame is 192,000 bytes. At 20 fps that is ~31 Mbit/s - fine over 2.4 GHz
-  Wi-Fi on a quiet network, but the Pico W's CYW43439 is the real limit; drop `--fps`
-  if you see stutter.
+* The safe 320x240 RGB565 mode is 153,600 bytes/frame. At 20 fps that is
+  ~24.6 Mbit/s before TCP/Wi-Fi overhead. The Pico W's CYW43439 is the real
+  limit; lower `fps` if the client stalls.
 * TCP back-pressure paces the stream automatically: a slow board simply receives
   fewer frames instead of desynchronising.
