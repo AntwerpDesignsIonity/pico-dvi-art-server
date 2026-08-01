@@ -34,7 +34,6 @@ from dataclasses import fields
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-import serial
 from serial.tools import list_ports
 
 REPO = Path(__file__).resolve().parent.parent
@@ -49,9 +48,6 @@ PYTHON = sys.executable
 POLL_MS = 120
 PREVIEW_ZOOM = 2
 RASPBERRY_PI_VID = 0x2E8A
-USB_STREAM_FPS = 5.0
-USB_WRITE_CHUNK = 4096
-USB_ACK_TIMEOUT_S = 8.0
 DEVICE_SECRETS = REPO / "pico_firmware" / "device_secrets.py"
 SAFE_UF2 = REPO / "pico_firmware_c" / "build" / "pico_dvi_art_client.uf2"
 MODE_STAMP = REPO / "pico_firmware_c" / "build" / "dvi_mode.stamp"
@@ -133,8 +129,8 @@ class LogTee(io.TextIOBase):
                 pass
 
 
-class UsbFrameTransport:
-    """Stream frames over USB CDC when TCP is unavailable."""
+class UsbDeviceMonitor:
+    """Detect Raspberry Pi USB only for explicit firmware flashing."""
 
     def __init__(self, studio: "Studio") -> None:
         self.studio = studio
@@ -142,13 +138,9 @@ class UsbFrameTransport:
         self.pause_event = threading.Event()
         self.port: str | None = None
         self.connected = False
-        self.streaming = False
-        self.frames_sent = 0
-        self.frames_acked = 0
         self.error = ""
-        self._read_buffer = b""
         self.thread = threading.Thread(
-            target=self._run, name="usb-frame-transport", daemon=True
+            target=self._run, name="usb-device-monitor", daemon=True
         )
 
     def start(self) -> None:
@@ -193,16 +185,10 @@ class UsbFrameTransport:
                 return drive
         return None
 
-    @staticmethod
-    def _tcp_connected(server: ArtServer) -> bool:
-        with server._clients_lock:
-            return bool(server._clients)
-
     def _run(self) -> None:
         while not self.stop_event.is_set():
             if self.pause_event.is_set():
                 self.connected = False
-                self.streaming = False
                 self.stop_event.wait(0.1)
                 continue
             bootsel = self._bootsel_drive()
@@ -215,33 +201,22 @@ class UsbFrameTransport:
             if port is None:
                 self.port = None
                 self.connected = False
-                self.streaming = False
                 self.stop_event.wait(1)
                 continue
 
+            first_seen = not self.connected or self.port != port
             self.port = port
-            try:
-                with serial.Serial(
-                    port, 115200, timeout=0, write_timeout=8
-                ) as device:
-                    self.connected = True
-                    self.error = ""
-                    self.studio.log(f"[usb] Pico connected on {port}")
-                    self._stream(device)
-            except (OSError, serial.SerialException) as exc:
-                message = str(exc)
-                if message != self.error:
-                    self.studio.log(f"[usb] {port} disconnected: {message}")
-                self.error = message
-            finally:
-                self.connected = False
-                self.streaming = False
+            self.connected = True
+            self.error = ""
+            if first_seen:
+                self.studio.log(
+                    f"[usb] Pico detected on {port} for firmware flashing only"
+                )
             self.stop_event.wait(1)
 
     def _recover_bootsel(self, drive: Path) -> None:
         self.port = f"RP2350 BOOTSEL {drive}"
         self.connected = True
-        self.streaming = False
         try:
             mode = MODE_STAMP.read_text(encoding="utf-8").strip()
         except OSError:
@@ -272,63 +247,6 @@ class UsbFrameTransport:
             return
         self.studio.log("[usb] safe firmware copied; waiting for Pico reboot")
 
-    def _stream(self, device: serial.Serial) -> None:
-        interval = 1.0 / USB_STREAM_FPS
-        next_due = time.monotonic()
-        while not self.stop_event.is_set() and not self.pause_event.is_set():
-            self._read_status(device)
-            server = self.studio.server
-            if server is None or self._tcp_connected(server):
-                self.streaming = False
-                self.stop_event.wait(0.2)
-                next_due = time.monotonic()
-                continue
-
-            packet = memoryview(server.frame_bytes())
-            ack_before = self.frames_acked
-            for offset in range(0, len(packet), USB_WRITE_CHUNK):
-                device.write(packet[offset : offset + USB_WRITE_CHUNK])
-            device.flush()
-            self.frames_sent += 1
-
-            ack_deadline = time.monotonic() + USB_ACK_TIMEOUT_S
-            while (
-                not self.stop_event.is_set()
-                and not self.pause_event.is_set()
-                and self.frames_acked == ack_before
-                and time.monotonic() < ack_deadline
-            ):
-                self._read_status(device)
-                self.stop_event.wait(0.01)
-            if self.frames_acked == ack_before:
-                raise serial.SerialTimeoutException(
-                    "Pico did not acknowledge the completed USB frame"
-                )
-            self.streaming = True
-
-            next_due += interval
-            delay = next_due - time.monotonic()
-            if delay > 0:
-                self.stop_event.wait(delay)
-            else:
-                next_due = time.monotonic()
-
-    def _read_status(self, device: serial.Serial) -> None:
-        self._read_buffer += device.read_all()
-        while b"\n" in self._read_buffer:
-            raw, self._read_buffer = self._read_buffer.split(b"\n", 1)
-            line = raw.decode("utf-8", "replace").strip()
-            if line.startswith("USBFRAME "):
-                try:
-                    self.frames_acked = int(line.split()[1])
-                except (IndexError, ValueError):
-                    continue
-                if self.frames_acked == 1 or self.frames_acked % 25 == 0:
-                    self.studio.log(
-                        f"[usb] Pico confirmed {self.frames_acked} displayed frames"
-                    )
-
-
 class Studio(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -343,7 +261,7 @@ class Studio(tk.Tk):
         self.vars: dict[str, tk.Variable] = {}
         self._preview_img: tk.PhotoImage | None = None
         self._busy = False
-        self.usb = UsbFrameTransport(self)
+        self.usb = UsbDeviceMonitor(self)
 
         sys.stdout = LogTee(self.logq, sys.__stdout__)
         sys.stderr = LogTee(self.logq, sys.__stderr__)
@@ -737,16 +655,13 @@ class Studio(tk.Tk):
 
         if not clients:
             if self.usb.connected:
-                mode = "streaming real frames" if self.usb.streaming else "connected"
                 self.device_label.configure(
-                    text=f"Pico connected by USB on {self.usb.port}.\n"
-                         f"USB fallback: {mode} at up to {USB_STREAM_FPS:g} fps.\n"
-                         f"Frames sent: {self.usb.frames_sent}   "
-                         f"shown by Pico: {self.usb.frames_acked}"
+                    text=f"Pico detected on {self.usb.port} for firmware flashing.\n"
+                         "Runtime artwork: waiting for the Pico's Wi-Fi connection."
                 )
                 return
             self.device_label.configure(
-                text="No Raspberry Pi Pico detected by TCP or USB."
+                text="No Pico connected over Wi-Fi. USB is used only for flashing."
             )
             return
 

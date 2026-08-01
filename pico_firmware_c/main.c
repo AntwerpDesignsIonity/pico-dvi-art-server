@@ -78,7 +78,6 @@
 // lwIP retransmits an unanswered SYN with a growing backoff; give a connect
 // long enough to survive that before calling it dead.
 #define TCP_CONNECT_WINDOW_MS 12000
-#define USB_RX_BUDGET_BYTES 16384
 
 struct dvi_inst dvi0;
 static bool dvi_running = false;
@@ -118,11 +117,8 @@ static struct tcp_pcb *client_pcb = NULL;
 static volatile bool link_up = false;
 static volatile bool reboot_to_bootsel = false;
 static volatile bool reboot_requested = false;
-static uint8_t usb_rx_buffer[1024];
 
 // ---------------------------------------------------------------- helpers
-static void poll_usb_frames(void);
-
 static float chip_temperature(void) {
     adc_select_input(4);
     // 12-bit conversion over the 3.3V reference, per the RP2350 datasheet.
@@ -265,7 +261,6 @@ static bool wifi_join(uint32_t timeout_ms) {
 
     while (absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
         watchdog_update();
-        poll_usb_frames();
         cyw43_arch_poll();
         int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
         if (status != last_status) {
@@ -383,28 +378,6 @@ static void consume(const uint8_t *data, uint32_t len) {
     }
 }
 
-static void poll_usb_frames(void) {
-    // USB is an automatic fallback when the Wi-Fi TCP stream is unavailable.
-    // Cap work per refresh so DVI scan-out and the watchdog remain serviced.
-    if (link_up || !stdio_usb_connected()) return;
-
-    uint32_t frames_before = rx.frames;
-    uint32_t budget = USB_RX_BUDGET_BYTES;
-    while (budget > 0) {
-        int request = budget < sizeof(usb_rx_buffer)
-                    ? (int)budget : (int)sizeof(usb_rx_buffer);
-        int count = stdio_get_until(
-            (char *)usb_rx_buffer, request, get_absolute_time()
-        );
-        if (count <= 0) break;
-        consume(usb_rx_buffer, (uint32_t)count);
-        budget -= (uint32_t)count;
-    }
-    if (rx.frames != frames_before) {
-        printf("USBFRAME %lu\n", (unsigned long)rx.frames);
-    }
-}
-
 // ---------------------------------------------------------------- lwIP glue
 static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     (void)arg;
@@ -442,7 +415,6 @@ static err_t on_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
     printf("[net] linked - streaming pixels\n");
     snprintf(status_line, sizeof(status_line), "STREAMING");
     link_up = true;
-    // Discard a partial USB fallback packet before TCP becomes the sole source.
     rx.state = RX_HEADER;
     rx.header_got = 0;
     rx.payload_got = 0;
@@ -698,9 +670,7 @@ int main(void) {
             int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
             printf("[net] retry: wifi status %d, ip %s\n", status, ip_string());
 
-            bool usb_fallback = stdio_usb_connected();
-            bool associated = (status == CYW43_LINK_UP)
-                           || (!usb_fallback && wifi_join(JOIN_TIMEOUT_MS));
+            bool associated = (status == CYW43_LINK_UP) || wifi_join(JOIN_TIMEOUT_MS);
             if (associated) {
                 wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
                 join_failures = 0;
@@ -710,11 +680,6 @@ int main(void) {
                 // answer. Aborting after three would throw away connections
                 // that were about to succeed.
                 next_retry = make_timeout_time_ms(TCP_CONNECT_WINDOW_MS);
-            } else if (usb_fallback) {
-                // Do not spend 20 seconds inside a Wi-Fi join while USB is
-                // actively carrying frames; core0 must keep feeding DVI.
-                snprintf(status_line, sizeof(status_line), "USB STREAMING");
-                next_retry = make_timeout_time_ms(5000);
             } else {
                 // Back off exponentially. Association requests fired every few
                 // seconds get the MAC rate-limited by the AP, which is exactly
@@ -762,7 +727,6 @@ int main(void) {
         }
 
 
-        poll_usb_frames();
         if (frame_ready) {
             frame_ready = false;
             front_idx ^= 1;               // publish the freshly received frame

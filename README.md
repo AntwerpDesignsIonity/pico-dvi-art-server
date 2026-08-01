@@ -1,6 +1,6 @@
 # pico-dvi-art-server
 
-Infinite generative art streamed over Wi-Fi or USB to a **Raspberry Pi Pico 2 W**
+Infinite generative art streamed over Wi-Fi to a **Raspberry Pi Pico 2 W**
 driving a **Waveshare PICO-DVI-LCD 10.1**. The native desktop application controls
 the art, HUD, Wi-Fi provisioning, firmware builds, flashing and OTA.
 
@@ -15,8 +15,8 @@ the art, HUD, Wi-Fi provisioning, firmware builds, flashing and OTA.
 * **Retro arcade cycle:** five original colorful faux-3D pixel-art scenes (falling
   blocks, maze chase, tank arena, platform runner and ice climb), with the clock,
   date and temperatures centered and no border.
-* **Automatic dual transport:** Wi-Fi TCP is used when available; USB CDC carries
-  the same real RGB565 frames when Wi-Fi is unavailable.
+* **Wi-Fi runtime transport:** live RGB565 artwork is delivered over TCP. USB is
+  reserved for explicit firmware flashing and diagnostics.
 * **Working Push OTA:** builds the selected C firmware, releases USB cleanly, enters
   BOOTSEL, copies the UF2 and resumes streaming. Network-only devices receive the
   reboot command over TCP before the same UF2 copy.
