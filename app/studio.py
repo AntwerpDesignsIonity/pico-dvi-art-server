@@ -23,6 +23,7 @@ import io
 import json
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -52,6 +53,8 @@ USB_STREAM_FPS = 5.0
 USB_WRITE_CHUNK = 4096
 USB_ACK_TIMEOUT_S = 8.0
 DEVICE_SECRETS = REPO / "pico_firmware" / "device_secrets.py"
+SAFE_UF2 = REPO / "pico_firmware_c" / "build" / "pico_dvi_art_client.uf2"
+MODE_STAMP = REPO / "pico_firmware_c" / "build" / "dvi_mode.stamp"
 _INSTANCE_MUTEX = None
 
 # (field name, label, widget kind, options)
@@ -176,6 +179,21 @@ class UsbFrameTransport:
         )
 
     @staticmethod
+    def _bootsel_drive() -> Path | None:
+        if sys.platform != "win32":
+            return None
+        for letter in range(ord("D"), ord("Z") + 1):
+            drive = Path(f"{chr(letter)}:\\")
+            info = drive / "INFO_UF2.TXT"
+            try:
+                text = info.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "RP2350" in text:
+                return drive
+        return None
+
+    @staticmethod
     def _tcp_connected(server: ArtServer) -> bool:
         with server._clients_lock:
             return bool(server._clients)
@@ -187,6 +205,12 @@ class UsbFrameTransport:
                 self.streaming = False
                 self.stop_event.wait(0.1)
                 continue
+            bootsel = self._bootsel_drive()
+            if bootsel is not None:
+                self._recover_bootsel(bootsel)
+                self.stop_event.wait(3)
+                continue
+
             port = self._pico_port()
             if port is None:
                 self.port = None
@@ -213,6 +237,40 @@ class UsbFrameTransport:
                 self.connected = False
                 self.streaming = False
             self.stop_event.wait(1)
+
+    def _recover_bootsel(self, drive: Path) -> None:
+        self.port = f"RP2350 BOOTSEL {drive}"
+        self.connected = True
+        self.streaming = False
+        try:
+            mode = MODE_STAMP.read_text(encoding="utf-8").strip()
+        except OSError:
+            mode = ""
+        if mode != "640x480" or not SAFE_UF2.exists():
+            self.studio.log("[usb] building safe 640x480 recovery firmware")
+            result = subprocess.run(
+                [
+                    PYTHON,
+                    str(REPO / "tools" / "build_firmware.py"),
+                    "--mode",
+                    "640x480",
+                ],
+                cwd=str(REPO),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                self.error = result.stdout or result.stderr or "recovery build failed"
+                self.studio.log(f"[usb] recovery build failed: {self.error}")
+                return
+        self.studio.log(f"[usb] RP2350 BOOTSEL detected at {drive}; flashing safe firmware")
+        try:
+            shutil.copy2(SAFE_UF2, drive / SAFE_UF2.name)
+        except OSError as exc:
+            self.error = str(exc)
+            self.studio.log(f"[usb] recovery flash failed: {exc}")
+            return
+        self.studio.log("[usb] safe firmware copied; waiting for Pico reboot")
 
     def _stream(self, device: serial.Serial) -> None:
         interval = 1.0 / USB_STREAM_FPS
