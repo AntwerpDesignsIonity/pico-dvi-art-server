@@ -239,6 +239,24 @@ class CopyOrderTests(unittest.TestCase):
     has to be one mpremote invocation, because each one re-enters the REPL.
     """
 
+    def setUp(self):
+        # copy_firmware() checks the local files exist before touching the
+        # board. device_secrets.py is git-ignored, so on a fresh clone it is
+        # absent - point the flasher at a fully populated stand-in directory
+        # to keep these tests hermetic.
+        import tempfile
+
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        for name in flash_pico.FIRMWARE_FILES + ["device_secrets.py"]:
+            (folder / name).write_text("# stub\n", encoding="utf-8")
+        patcher_dir = mock.patch.object(flash_pico, "FIRMWARE_DIR", folder)
+        patcher_secrets = mock.patch.object(flash_pico, "SECRETS", folder / "device_secrets.py")
+        patcher_dir.start()
+        patcher_secrets.start()
+        self.addCleanup(patcher_dir.stop)
+        self.addCleanup(patcher_secrets.stop)
+
     def _capture(self):
         calls = []
 

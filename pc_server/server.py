@@ -167,7 +167,11 @@ class ArtServer:
             f"{cfg.frame_size} B/frame | source={cfg.source} | fps={cfg.fps:g}"
         )
         print(f"[*] local addresses: {', '.join(local_addresses())}")
-        print(f"[*] touch {OTA_TRIGGER.name} (or run push_ota.py) to order an OTA update")
+        print(
+            f"[*] use the app's 'Push OTA' button (or create {OTA_TRIGGER.name}, "
+            "e.g. `New-Item ota.trigger` on Windows or `touch ota.trigger` on "
+            "Linux/macOS, or run push_ota.py) to order an OTA update"
+        )
 
         watcher = threading.Thread(target=self._ota_watch_loop, name="ota-watch", daemon=True)
         watcher.start()

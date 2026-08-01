@@ -78,6 +78,17 @@
 // lwIP retransmits an unanswered SYN with a growing backoff; give a connect
 // long enough to survive that before calling it dead.
 #define TCP_CONNECT_WINDOW_MS 12000
+// A mesh node can accept the association and lease an address yet never bridge
+// our traffic onto the LAN: the link reports "up" while every TCP connect dies
+// unanswered. Only re-associating (and, if that keeps happening, power-cycling
+// the radio) can move us onto a node that actually forwards packets.
+#define CONNECT_WINDOWS_BEFORE_REJOIN 4
+#define REJOINS_BEFORE_RADIO_RESET    3
+// The CYW43 defaults to PM2 powersave, where the radio dozes between beacons.
+// Mesh nodes routinely fail to buffer traffic for dozing clients, so ARP for
+// us goes unanswered and the board turns unreachable seconds after it joins.
+// This is a mains-powered display: keep the radio awake.
+#define RADIO_PM_MODE cyw43_pm_value(CYW43_NO_POWERSAVE_MODE, 20, 1, 1, 1)
 
 struct dvi_inst dvi0;
 static bool dvi_running = false;
@@ -277,6 +288,25 @@ static bool wifi_join(uint32_t timeout_ms) {
 
     printf("[wifi] no link after %lu ms\n", (unsigned long)timeout_ms);
     return false;
+}
+
+// A radio that keeps getting refused, or keeps associating to a node that
+// bridges nothing, holds firmware-side state that only a full power-cycle
+// clears. If it does not come back, the watchdog reboot is the last resort.
+static void radio_power_cycle(void) {
+    printf("[wifi] power-cycling the radio\n");
+    watchdog_update();
+    cyw43_arch_deinit();
+    sleep_ms(500);
+    watchdog_update();
+    if (cyw43_arch_init() != 0) {
+        printf("[wifi] radio did not come back - rebooting\n");
+        watchdog_reboot(0, 0, 0);
+    }
+    cyw43_arch_enable_sta_mode();
+    cyw43_wifi_pm(&cyw43_state, RADIO_PM_MODE);
+    printf("[wifi] radio back up\n");
+    watchdog_update();
 }
 
 static void send_line(const char *text) {    if (!client_pcb || !link_up) return;
@@ -621,6 +651,7 @@ int main(void) {
         printf("[wifi] init failed - staying offline\n");
     } else {
         cyw43_arch_enable_sta_mode();
+        cyw43_wifi_pm(&cyw43_state, RADIO_PM_MODE);
         printf("[wifi] connecting to %s\n", WIFI_SSID);
         // Join straight away. A scan leaves the radio hopping channels and
         // makes the association that follows it noticeably less reliable, so
@@ -645,6 +676,8 @@ int main(void) {
     uint32_t wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
     bool scanned_once = false;
     uint32_t join_failures = 0;
+    uint32_t connect_windows_failed = 0;
+    uint32_t rejoins_without_stream = 0;
     absolute_time_t next_stat  = make_timeout_time_ms(5000);
     uint standby_frame = 0;
     uint32_t shown = 0;
@@ -665,15 +698,38 @@ int main(void) {
             watchdog_reboot(0, 0, 0);
         }
 
+        if (link_up) {
+            connect_windows_failed = 0;
+            rejoins_without_stream = 0;
+        }
+
         if (!link_up && absolute_time_diff_us(get_absolute_time(), next_retry) <= 0) {
             close_link();
             int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
             printf("[net] retry: wifi status %d, ip %s\n", status, ip_string());
 
+            // "Up" is no proof of a working network: a mesh node can associate
+            // us, lease an address and then bridge nothing. When repeated
+            // connect windows die on an allegedly healthy link, drop the
+            // association and let the mesh place us again - and if rejoining
+            // never leads to a stream either, the radio is the next suspect.
+            if (status == CYW43_LINK_UP &&
+                    connect_windows_failed >= CONNECT_WINDOWS_BEFORE_REJOIN) {
+                connect_windows_failed = 0;
+                printf("[net] link up but the server never answers - rejoining wifi\n");
+                snprintf(status_line, sizeof(status_line), "SERVER UNREACHABLE - REJOIN");
+                if (++rejoins_without_stream >= REJOINS_BEFORE_RADIO_RESET) {
+                    rejoins_without_stream = 0;
+                    radio_power_cycle();
+                }
+                status = CYW43_LINK_DOWN;   // force the join below
+            }
+
             bool associated = (status == CYW43_LINK_UP) || wifi_join(JOIN_TIMEOUT_MS);
             if (associated) {
                 wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
                 join_failures = 0;
+                connect_windows_failed++;
                 connect_to_server();
                 // lwIP retransmits the SYN with a growing backoff, so a healthy
                 // but momentarily busy network can take several seconds to
@@ -699,19 +755,8 @@ int main(void) {
                 // clears it, so escalate to that rather than retrying forever.
                 if (++join_failures >= JOIN_FAILURES_BEFORE_RESET) {
                     join_failures = 0;
-                    printf("[wifi] resetting the radio after repeated refusals\n");
-                    watchdog_update();
-                    cyw43_arch_deinit();
-                    sleep_ms(500);
-                    watchdog_update();
-                    if (cyw43_arch_init() == 0) {
-                        cyw43_arch_enable_sta_mode();
-                        printf("[wifi] radio back up\n");
-                    } else {
-                        printf("[wifi] radio did not come back - rebooting\n");
-                        watchdog_reboot(0, 0, 0);
-                    }
-                    watchdog_update();
+                    printf("[wifi] repeated refusals - escalating\n");
+                    radio_power_cycle();
                 }
                 printf("[net] wifi retry in %lu ms\n",
                        (unsigned long)wifi_backoff_ms);
