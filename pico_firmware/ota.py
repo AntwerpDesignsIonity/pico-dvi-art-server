@@ -121,9 +121,16 @@ def local_manifest():
 def _get(url, timeout=15):
     import urequests
 
-    # Cache-buster: the GitHub raw CDN happily serves stale content.
+    # raw.githubusercontent.com is served by Fastly with a hard max-age=300 that
+    # a client cannot bypass, so a fresh push takes up to 5 minutes to become
+    # visible here. The cache-buster and no-cache headers only help on the edges
+    # of that window; the real safety net is the version re-check below.
     separator = "&" if "?" in url else "?"
-    return urequests.get(url + separator + "t=" + str(time.time()), timeout=timeout)
+    return urequests.get(
+        url + separator + "t=" + str(time.time()),
+        timeout=timeout,
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+    )
 
 
 def _looks_like_code(text):
@@ -173,6 +180,21 @@ def check_and_update(verbose=True):
             print("[ota]   staged", name, len(text), "bytes")
     except Exception as exc:
         print("[ota] download aborted:", exc)
+        for name in staged:
+            remove(name + ".new")
+        return False
+
+    # The CDN serves each file with its own TTL, so a publish landing mid-download
+    # could mix old and new code. Re-check the version before committing anything.
+    try:
+        response = _get(config.RAW_BASE + VERSION_FILE)
+        confirmed = int(response.json().get("version", 0))
+        response.close()
+    except Exception as exc:
+        print("[ota] re-check failed:", exc)
+        confirmed = remote_version  # network died after a clean download; proceed
+    if confirmed != remote_version:
+        print("[ota] version moved %d -> %d mid-download, retrying later" % (remote_version, confirmed))
         for name in staged:
             remove(name + ".new")
         return False

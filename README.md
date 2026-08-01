@@ -76,7 +76,7 @@ period**. The numbers below are the *perceived* rhythms, not loop lengths.
 | Server temperature refresh | **10 min** | `temp_refresh_s` |
 | New AI image (when enabled) | **90 s**, 3 s cross-fade | `ai_interval_s`, `ai_fade_s` |
 | OTA check | **on boot + hourly** | `OTA_ON_BOOT`, `OTA_CHECK_MINUTES` |
-| OTA on demand | ~2 s | `python pc_server/push_ota.py` |
+| OTA on demand | ~2 s to reach the board (+ up to 5 min GitHub CDN lag) | `python pc_server/push_ota.py` |
 | Reconnect after server loss | 3 s, infinite retry | `RECONNECT_DELAY_S` |
 
 Because the drift terms are incommensurable, the *combination* of swirl angle, zoom,
@@ -215,12 +215,20 @@ python pc_server/push_ota.py --reboot         # {"cmd": "reboot"}
 The running server picks the trigger file up within 2 seconds and broadcasts the
 command to every connected board.
 
+**Propagation delay.** `raw.githubusercontent.com` is fronted by a CDN with a hard
+`max-age=300`, so a freshly pushed commit takes **up to 5 minutes** to become visible
+to the board — no client-side header can bypass it. If you push and immediately run
+`push_ota.py`, the device may still see the old version; it will pick the new one up
+on its next hourly check, or just wait five minutes and trigger again.
+
 **Safety net.** Files are downloaded to `<name>.new` and validated (non-empty, not a
-GitHub 404 page) before anything is replaced; the old copies are kept as `<name>.bak`
-and an `ota.pending` marker is written. `main.py` calls `ota.mark_boot_ok()` after
-20 successfully streamed frames, which clears the marker. If the board never gets
-that far, the next boot restores the backups, marks the bad version as `blocked` and
-refuses to install it again - push a higher version to recover.
+GitHub 404 page) before anything is replaced. The version is then re-checked, so a
+publish landing mid-download can never mix old and new files. The old copies are kept
+as `<name>.bak` and an `ota.pending` marker is written. `main.py` calls
+`ota.mark_boot_ok()` after 20 successfully streamed frames, which clears the marker.
+If the board never gets that far, the next boot restores the backups, marks the bad
+version as `blocked` and refuses to install it again — push a higher version to
+recover.
 
 `config.py` and `device_secrets.py` are deliberately excluded from the manifest, so
 OTA never overwrites your Wi-Fi credentials.

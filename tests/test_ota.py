@@ -42,10 +42,12 @@ class FakeGitHub:
         self.files: dict[str, str] = {}
         self.fail_on: set[str] = set()
         self.requests: list[str] = []
+        self.headers: list[dict] = []
 
-    def get(self, url, timeout=15):
+    def get(self, url, timeout=15, headers=None):
         name = url.split("/")[-1].split("?")[0]
         self.requests.append(name)
+        self.headers.append(headers or {})
         if name in self.fail_on:
             raise OSError("network down for " + name)
         if name not in self.files:
@@ -120,6 +122,13 @@ class OtaTests(unittest.TestCase):
         self.assertFalse(self.ota.check_and_update())
         self.assertEqual(self.reset_count, 0)
         self.assertEqual(Path("main.py").read_text(), "# firmware v1 main.py\nVALUE = 1\n")
+
+    def test_requests_defeat_the_cdn_cache(self):
+        self.publish(1)
+        self.ota.check_and_update()
+        self.assertTrue(self.github.headers, "no request was made")
+        for sent in self.github.headers:
+            self.assertEqual(sent.get("Cache-Control"), "no-cache")
 
     def test_update_stages_backs_up_and_resets(self):
         self.publish(2)
@@ -203,6 +212,29 @@ class OtaTests(unittest.TestCase):
         self.github.fail_on.add("version.json")
         self.assertFalse(self.ota.check_and_update())
         self.assertEqual(self.reset_count, 0)
+
+    def test_publish_landing_mid_download_is_rejected(self):
+        """A newer push arriving while we download must not mix file versions."""
+        self.publish(2)
+        original_get = self.github.get
+        state = {"seen": 0}
+
+        def racing_get(url, timeout=15, headers=None):
+            name = url.split("/")[-1].split("?")[0]
+            if name == "version.json":
+                state["seen"] += 1
+                if state["seen"] > 1:  # the re-check sees v3 already published
+                    return FakeResponse(json.dumps({"version": 3, "files": []}))
+            return original_get(url, timeout, headers)
+
+        self.github.get = racing_get
+        sys.modules["urequests"].get = racing_get
+
+        self.assertFalse(self.ota.check_and_update())
+        self.assertEqual(self.reset_count, 0)
+        self.assertIn("VALUE = 1", Path("main.py").read_text())
+        self.assertFalse(Path("main.py.new").exists())
+        self.assertEqual(self.ota.local_version(), 1)
 
 
 if __name__ == "__main__":
