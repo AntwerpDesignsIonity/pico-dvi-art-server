@@ -65,9 +65,9 @@ python -m PyInstaller --onefile --windowed --name "PicoDVIArtStudio" ^
     --paths pc_server --distpath . app\studio.py
 ```
 
-This produces `PicoDVIArtStudio.exe` at the repo root (kept out of git via
-`.gitignore` - it's a ~30 MB generated binary, not a source file). It must
-stay in this folder (next to `pico_firmware_c/`, `pico_firmware/`,
+This produces `PicoDVIArtStudio.exe` at the repo root. The current release
+executable is committed to the repository so it can be downloaded and run
+directly. It must stay in this folder (next to `pico_firmware_c/`, `pico_firmware/`,
 `pc_server/`, `tools/`) since it uses the same relative paths as
 `app/studio.py`. Building/flashing firmware from the `.exe` still needs a
 system Python with CMake/Ninja/the Pico SDK installed; the streaming/HUD/OTA

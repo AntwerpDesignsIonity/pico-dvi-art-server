@@ -22,11 +22,9 @@ pico_firmware_c/wifi_config.h
 pico_firmware_c/build/
 pico_firmware_c/build-*/
 
-# Packaged standalone desktop app (built with PyInstaller: build_exe_tmp is
-# its scratch dir; PicoDVIArtStudio.exe is the ~30MB generated binary, never
-# a source artifact - rebuild it locally with the command in README.md).
+# Packaged standalone desktop app build scratch files. The release executable
+# itself is intentionally committed so users can run the appliance directly.
 build_exe_tmp/
-PicoDVIArtStudio.exe
 PicoDVIArtStudio_debug.exe
 
 # Pico OTA leftovers (only ever exist on the device, never in the repo)
