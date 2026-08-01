@@ -38,7 +38,7 @@ class Config:
     # The C firmware renders locally; these values drive the desktop preview
     # and remain compatible with legacy frame-streaming firmware.
     dvi_mode: str = "640x480"
-    dvi_invert_diffpairs: int = 0
+    dvi_invert_diffpairs: int = 1
     width: int = 320
     height: int = 240
     byte_order: str = "little"  # legacy frame protocol and preview packing

@@ -2,7 +2,7 @@
   "host": "0.0.0.0",
   "port": 5001,
   "dvi_mode": "640x480",
-  "dvi_invert_diffpairs": 0,
+  "dvi_invert_diffpairs": 1,
   "width": 320,
   "height": 240,
   "byte_order": "little",

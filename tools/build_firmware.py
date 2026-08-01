@@ -201,7 +201,7 @@ def shell_through_vcvars(vcvars: str, command: list[str], cwd: Path) -> int:
     return subprocess.call(line, shell=True, cwd=cwd)
 
 
-def build(clean: bool = False, mode: str = "640x480", invert_diffpairs: int = 0) -> Path:
+def build(clean: bool = False, mode: str = "640x480", invert_diffpairs: int = 1) -> Path:
     ensure_sources()
     write_wifi_config()
 
@@ -322,9 +322,9 @@ def main(argv=None) -> int:
     parser.add_argument("--mode", default="640x480", choices=["640x480", "800x480"],
                         help="panel mode: 640x480 (320x240 buffer) or 800x480 (400x240)")
     parser.add_argument(
-        "--invert-diffpairs", type=int, default=0, choices=[0, 1],
-        help="TMDS diff-pair polarity (0=normal; try 1 if the panel shows a "
-             "solid colour instead of the local animation)",
+        "--invert-diffpairs", type=int, default=1, choices=[0, 1],
+        help="TMDS diff-pair polarity (1 matches this carrier; try 0 only if "
+             "the panel never locks)",
     )
     args = parser.parse_args(argv)
 

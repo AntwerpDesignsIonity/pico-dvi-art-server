@@ -83,7 +83,6 @@
 #define RADIO_PM_MODE cyw43_pm_value(CYW43_NO_POWERSAVE_MODE, 20, 1, 1, 1)
 
 struct dvi_inst dvi0;
-static bool dvi_running = false;
 
 // Updated by the network code for the small status overlay.
 static char status_line[48] = "STARTING";
@@ -93,9 +92,7 @@ static float cached_temperature = 0.0f;
 // Two framebuffers: core0 scans one out while rendering into the other.
 static uint16_t framebuf[2][FRAME_PIXELS];
 static volatile uint8_t front_idx = 0;
-
-static inline uint16_t *front_buffer(void) { return framebuf[front_idx]; }
-static inline uint16_t *back_buffer(void)  { return framebuf[front_idx ^ 1]; }
+static volatile uint8_t scanout_idx = 0;
 
 // ---------------------------------------------------------------- protocol
 static const uint8_t MAGIC_FRAME[4]   = {0xAA, 0xBB, 0xCC, 0xDD};
@@ -595,30 +592,26 @@ static void draw_local_art(uint16_t *buf, uint32_t frame) {
 }
 
 // ---------------------------------------------------------------- cores
-static void core1_main(void) {
-    dvi_register_irqs_this_core(&dvi0, DMA_IRQ_0);
-    while (queue_is_empty(&dvi0.q_colour_valid))
-        __wfe();
-    dvi_start(&dvi0);
-    dvi_scanbuf_main_16bpp(&dvi0);
+static void core1_scanline_callback(void) {
+    const uint16_t *scanline_ptr;
+    while (queue_try_remove_u32(&dvi0.q_colour_free, &scanline_ptr))
+        ;
+
+    // Lines 0 and 1 are queued before DVI starts. Latch the published buffer
+    // only at a frame boundary so a core0 flip cannot tear a frame.
+    static uint scanline = 2;
+    if (scanline == 0) {
+        scanout_idx = front_idx;
+    }
+    scanline_ptr = &framebuf[scanout_idx][scanline * FRAME_WIDTH];
+    queue_add_blocking_u32(&dvi0.q_colour_valid, &scanline_ptr);
+    scanline = (scanline + 1) % FRAME_HEIGHT;
 }
 
-// Push one whole frame worth of scanline pointers at core1.
-static void scan_out_frame(void) {
-    // Without DVI running there is no consumer, and queue_add_blocking would
-    // spin forever - taking USB down with it and leaving the board needing a
-    // physical BOOTSEL. Pace the loop instead so diagnostics stay reachable.
-    if (!dvi_running) {
-        sleep_ms(16);
-        return;
-    }
-    uint16_t *buf = front_buffer();
-    for (uint y = 0; y < FRAME_HEIGHT; ++y) {
-        const uint16_t *scanline = &buf[y * FRAME_WIDTH];
-        queue_add_blocking_u32(&dvi0.q_colour_valid, &scanline);
-        while (queue_try_remove_u32(&dvi0.q_colour_free, &scanline))
-            ;
-    }
+static void core1_main(void) {
+    dvi_register_irqs_this_core(&dvi0, DMA_IRQ_0);
+    dvi_start(&dvi0);
+    dvi_scanbuf_main_16bpp(&dvi0);
 }
 
 int main(void) {
@@ -665,6 +658,7 @@ int main(void) {
 
     dvi0.timing = &DVI_TIMING;
     dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
+    dvi0.scanline_callback = core1_scanline_callback;
 #ifdef DVI_INVERT_DIFFPAIRS_OVERRIDE
     // A solid single-colour "no signal" screen on the panel (rather than the
     // expected checkered standby pattern) means the sink's TMDS clock/data
@@ -675,8 +669,11 @@ int main(void) {
 #endif
 #if !DIAG_SKIP_OVERCLOCK
     dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
+    const uint16_t *scanline_ptr = &framebuf[0][0];
+    queue_add_blocking_u32(&dvi0.q_colour_valid, &scanline_ptr);
+    scanline_ptr = &framebuf[0][FRAME_WIDTH];
+    queue_add_blocking_u32(&dvi0.q_colour_valid, &scanline_ptr);
     multicore_launch_core1(core1_main);
-    dvi_running = true;
 #endif
 
     // From here on the board must never need a human with a BOOTSEL button: if
@@ -760,13 +757,17 @@ int main(void) {
 
 
         if (absolute_time_diff_us(get_absolute_time(), next_render) <= 0) {
-            draw_local_art(back_buffer(), local_frame++);
-            front_idx ^= 1;
-            fps_frames++;
-            next_render = delayed_by_ms(next_render, 33);
+            uint8_t render_idx = front_idx ^ 1;
+            if (render_idx != scanout_idx) {
+                draw_local_art(framebuf[render_idx], local_frame++);
+                __dmb();
+                front_idx = render_idx;
+                fps_frames++;
+                next_render = delayed_by_ms(next_render, 33);
+            }
         }
 
-        scan_out_frame();
+        sleep_ms(1);
 
         if (absolute_time_diff_us(get_absolute_time(), fps_window) <= 0) {
             fps = fps_frames / 2.0f;

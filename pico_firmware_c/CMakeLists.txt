@@ -47,8 +47,8 @@ option(DVI_MODE_800X480 "Use 800x480p60 / 400x240 instead of 640x480p60 / 320x24
 # standby pattern) means the TMDS receiver never locked. That is the classic
 # symptom of the diff-pair polarity not matching the carrier's wiring, so make
 # it a one-flag toggle for testing without editing the shared pin-config
-# header. 0 = normal polarity (default), 1 = inverted.
-set(DVI_INVERT_DIFFPAIRS 0 CACHE STRING "TMDS diff-pair polarity (1=inverted, 0=normal)")
+# header. 1 matches this carrier's documented wiring; 0 is diagnostic.
+set(DVI_INVERT_DIFFPAIRS 1 CACHE STRING "TMDS diff-pair polarity (1=carrier default, 0=diagnostic)")
 
 target_compile_definitions(pico_dvi_art_client PRIVATE
     DVI_DEFAULT_SERIAL_CONFIG=${DVI_DEFAULT_SERIAL_CONFIG}

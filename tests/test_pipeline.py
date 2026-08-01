@@ -225,8 +225,8 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cfg.validate()
 
-    def test_normal_tmds_polarity_is_the_safe_default(self):
-        self.assertEqual(Config().dvi_invert_diffpairs, 0)
+    def test_carrier_tmds_polarity_is_the_safe_default(self):
+        self.assertEqual(Config().dvi_invert_diffpairs, 1)
 
     def test_ai_source_enables_worker(self):
         cfg = Config()
