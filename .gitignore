@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Server runtime artefacts
+pc_server/config.json
+pc_server/ota.trigger
+pc_server/art_cache/
+preview/
+
+# Pico OTA leftovers (only ever exist on the device, never in the repo)
+*.bak
+*.new
+ota.pending
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

@@ -1,0 +1,71 @@
+name: Release firmware version
+
+# Bumps pico_firmware/version.json whenever firmware code changes, so every
+# push to main is automatically picked up by the Pico W's OTA check.
+#
+# Commits made with GITHUB_TOKEN do not re-trigger workflows, and the message
+# carries [skip ci] as a second guard against loops.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pico_firmware/**.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version and refresh the file manifest
+        id: bump
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+
+          root = pathlib.Path("pico_firmware")
+          manifest = root / "version.json"
+          data = json.loads(manifest.read_text()) if manifest.exists() else {}
+
+          version = int(data.get("version", 0)) + 1
+          # config.py stays device-local: it holds Wi-Fi credentials.
+          files = sorted(
+              p.name for p in root.glob("*.py") if p.name != "config.py"
+          )
+          data.update({"version": version, "files": files})
+          data.pop("blocked", None)
+          manifest.write_text(json.dumps(data, indent=2) + "\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={version}\n")
+          print("new firmware version", version, files)
+          PY
+
+      - name: Commit the new version
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pico_firmware/version.json
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
+          git commit -m "chore: firmware v${{ steps.bump.outputs.version }} [skip ci]"
+          git push
+
+      - name: Summary
+        run: |
+          echo "Firmware **v${{ steps.bump.outputs.version }}** published." >> $GITHUB_STEP_SUMMARY
+          echo "Connected Pico W boards pick it up on their next boot or scheduled OTA check." >> $GITHUB_STEP_SUMMARY

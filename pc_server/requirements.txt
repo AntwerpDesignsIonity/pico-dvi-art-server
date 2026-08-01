@@ -1,0 +1,7 @@
+# Core streaming engine
+numpy>=1.24
+
+# Optional extras:
+#   pillow  -> AI image mode (decode/resize generated art)
+#   psutil  -> temp_source = "cpu" (host CPU temperature on the HUD)
+# pip install pillow psutil

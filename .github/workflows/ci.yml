@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r pc_server/requirements.txt
+
+      - name: Run the pipeline tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Render throughput self-test
+        run: python pc_server/server.py --self-test 30 --temp-source none
+
+      - name: Byte-compile the Pico firmware
+        run: python -m compileall -q pico_firmware

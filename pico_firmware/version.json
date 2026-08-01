@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "files": [
+    "main.py",
+    "ota.py",
+    "display_driver.py",
+    "boot.py"
+  ]
+}
