@@ -53,6 +53,26 @@ python tools/flash_pico.py             # interactive setup, prompts for credenti
 python tools/flash_pico.py --dry-run   # show the plan
 ```
 
+### Building a standalone `.exe`
+
+`START.bat` needs Python installed. If you'd rather hand someone a single
+double-clickable file with no Python required, package the same app with
+PyInstaller:
+
+```
+pip install pyinstaller
+python -m PyInstaller --onefile --windowed --name "PicoDVIArtStudio" ^
+    --paths pc_server --distpath . app\studio.py
+```
+
+This produces `PicoDVIArtStudio.exe` at the repo root (kept out of git via
+`.gitignore` - it's a ~30 MB generated binary, not a source file). It must
+stay in this folder (next to `pico_firmware_c/`, `pico_firmware/`,
+`pc_server/`, `tools/`) since it uses the same relative paths as
+`app/studio.py`. Building/flashing firmware from the `.exe` still needs a
+system Python with CMake/Ninja/the Pico SDK installed; the streaming/HUD/OTA
+GUI itself does not.
+
 ---
 
 ## Architecture

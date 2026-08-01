@@ -36,7 +36,11 @@ from tkinter import messagebox, ttk
 
 from serial.tools import list_ports
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent.parent
+)
 sys.path.insert(0, str(REPO / "pc_server"))
 
 import numpy as np  # noqa: E402
@@ -44,7 +48,28 @@ import numpy as np  # noqa: E402
 from config import DVI_MODES, Config  # noqa: E402
 from server import ArtServer, local_addresses  # noqa: E402
 
-PYTHON = sys.executable
+
+def _find_system_python() -> str | None:
+    """Locate a real python.exe to run tools/*.py subprocesses.
+
+    When this app is itself a frozen .exe, sys.executable is that .exe, not
+    a Python interpreter - passing it as an argv[0] for build_firmware.py
+    would just relaunch the GUI. The firmware build/flash tools need CMake,
+    Ninja and the Pico SDK anyway, so they are only ever run on a dev
+    machine that has Python installed regardless of how this app was
+    started. Resolved lazily (not at import time) so a frozen build with no
+    system Python installed can still stream art - only Build/OTA need it.
+    """
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    for candidate in ("py", "python"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+PYTHON = sys.executable if not getattr(sys, "frozen", False) else None
 POLL_MS = 120
 PREVIEW_ZOOM = 2
 RASPBERRY_PI_VID = 0x2E8A
@@ -301,7 +326,7 @@ class UsbDeviceMonitor:
             mode = MODE_STAMP.read_text(encoding="utf-8").strip()
         except OSError:
             mode = ""
-        if mode != "640x480" or not SAFE_UF2.exists():
+        if not mode.startswith("640x480") or not SAFE_UF2.exists():
             self.studio.log("[usb] building safe 640x480 recovery firmware")
             result = subprocess.run(
                 [
@@ -584,12 +609,26 @@ class Studio(tk.Tk):
         self.log("Server stopped.")
 
     # -- device ----------------------------------------------------------
+    def _tool_python(self) -> str | None:
+        python = PYTHON or _find_system_python()
+        if python is None:
+            messagebox.showerror(
+                "Python not found",
+                "Building/flashing firmware needs a system Python "
+                "installation (with CMake/Ninja/the Pico SDK). "
+                "Install Python 3.9+ and try again.",
+            )
+        return python
+
     def build_and_flash(self) -> None:
         if self._busy:
             return
         if not self.save_settings():
             return
-        args = [PYTHON, str(REPO / "tools" / "build_firmware.py"), "--flash",
+        python = self._tool_python()
+        if python is None:
+            return
+        args = [python, str(REPO / "tools" / "build_firmware.py"), "--flash",
                 "--mode", self.cfg.dvi_mode]
         self._run_tool(args, "firmware build + flash", release_usb=True)
 
@@ -598,6 +637,9 @@ class Studio(tk.Tk):
             return
         if not self.save_settings():
             return
+        python = self._tool_python()
+        if python is None:
+            return
         srv = self.server
         clients = []
         if srv is not None:
@@ -605,7 +647,7 @@ class Studio(tk.Tk):
                 clients = list(srv._clients)
         if self.usb.connected or self.usb.port:
             args = [
-                PYTHON, str(REPO / "tools" / "build_firmware.py"), "--flash",
+                python, str(REPO / "tools" / "build_firmware.py"), "--flash",
                 "--mode", self.cfg.dvi_mode,
             ]
             self._run_tool(args, "OTA build + USB flash", release_usb=True)
@@ -617,10 +659,10 @@ class Studio(tk.Tk):
             )
             return
         args = [
-            PYTHON, str(REPO / "tools" / "build_firmware.py"),
+            python, str(REPO / "tools" / "build_firmware.py"),
             "--mode", self.cfg.dvi_mode,
         ]
-        self._run_tool(args, "OTA build", network_ota=True)
+        self._run_tool(args, "OTA build", network_ota=True, python=python)
 
     def _run_tool(
         self,
@@ -629,6 +671,7 @@ class Studio(tk.Tk):
         *,
         release_usb: bool = False,
         network_ota: bool = False,
+        python: str | None = None,
     ) -> None:
         self._busy = True
         self.btn_build.configure(state="disabled")
@@ -655,7 +698,7 @@ class Studio(tk.Tk):
                     self.logq.put(f"[ota] reboot command sent to {sent} device(s)\n")
                     if sent:
                         flash_args = [
-                            PYTHON,
+                            python or PYTHON,
                             str(REPO / "tools" / "build_firmware.py"),
                             "--no-build",
                             "--flash",

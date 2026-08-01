@@ -661,6 +661,14 @@ int main(void) {
 
     dvi0.timing = &DVI_TIMING;
     dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
+#ifdef DVI_INVERT_DIFFPAIRS_OVERRIDE
+    // A solid single-colour "no signal" screen on the panel (rather than the
+    // expected checkered standby pattern) means the sink's TMDS clock/data
+    // recovery never locked - the classic cause is the diff-pair polarity
+    // not matching this carrier's wiring. Let a build override it for testing
+    // without touching the shared PicoDVI pin-config header.
+    dvi0.ser_cfg.invert_diffpairs = DVI_INVERT_DIFFPAIRS_OVERRIDE > 0;
+#endif
 #if !DIAG_SKIP_OVERCLOCK
     dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
     multicore_launch_core1(core1_main);

@@ -43,12 +43,20 @@ set(CYW43_PIO_CLOCK_DIV 4 CACHE STRING "cyw43 PIO SPI clock divider")
 # glass). Must match pc_server/config.py dvi_mode.
 option(DVI_MODE_800X480 "Use 800x480p60 / 400x240 instead of 640x480p60 / 320x240" OFF)
 
+# A solid single-colour "no signal" screen (instead of the expected checkered
+# standby pattern) means the TMDS receiver never locked. That is the classic
+# symptom of the diff-pair polarity not matching the carrier's wiring, so make
+# it a one-flag toggle for testing without editing the shared pin-config
+# header. 1 = inverted (this carrier's documented wiring), 0 = not inverted.
+set(DVI_INVERT_DIFFPAIRS 1 CACHE STRING "TMDS diff-pair polarity (1=inverted, 0=not)")
+
 target_compile_definitions(pico_dvi_art_client PRIVATE
     DVI_DEFAULT_SERIAL_CONFIG=${DVI_DEFAULT_SERIAL_CONFIG}
     DVI_VERTICAL_REPEAT=2
     DVI_N_TMDS_BUFFERS=3
     DVI_MONOCHROME_TMDS=0
     DVI_MODE_800X480=$<BOOL:${DVI_MODE_800X480}>
+    DVI_INVERT_DIFFPAIRS_OVERRIDE=${DVI_INVERT_DIFFPAIRS}
     CYW43_HOST_NAME="pico-dvi-art"
     CYW43_PIO_CLOCK_DIV_INT=${CYW43_PIO_CLOCK_DIV}
     # Give a USB console a few seconds to attach so the boot log - which
