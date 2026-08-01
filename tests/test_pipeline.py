@@ -190,6 +190,12 @@ class HudTests(unittest.TestCase):
         )
         self.assertGreater(frame[60:185, self.cfg.width // 4 : -self.cfg.width // 4].max(), 0)
         self.assertEqual(frame[:20, :20].max(), 0)
+        yellow = (
+            (frame[..., 0] == 255)
+            & (frame[..., 1] >= 190)
+            & (frame[..., 2] <= 180)
+        )
+        self.assertGreater(int(yellow.sum()), 20)
 
 
 class ConfigTests(unittest.TestCase):

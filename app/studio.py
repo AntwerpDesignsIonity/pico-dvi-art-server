@@ -18,6 +18,7 @@ Nothing here asks the user to pick a port, an IP or a file path.
 from __future__ import annotations
 
 import ast
+import ctypes
 import io
 import json
 import queue
@@ -48,7 +49,10 @@ POLL_MS = 120
 PREVIEW_ZOOM = 2
 RASPBERRY_PI_VID = 0x2E8A
 USB_STREAM_FPS = 5.0
+USB_WRITE_CHUNK = 4096
+USB_ACK_TIMEOUT_S = 8.0
 DEVICE_SECRETS = REPO / "pico_firmware" / "device_secrets.py"
+_INSTANCE_MUTEX = None
 
 # (field name, label, widget kind, options)
 SETTING_GROUPS: list[tuple[str, list[tuple[str, str, str, object]]]] = [
@@ -201,8 +205,10 @@ class UsbFrameTransport:
                     self.studio.log(f"[usb] Pico connected on {port}")
                     self._stream(device)
             except (OSError, serial.SerialException) as exc:
-                self.error = str(exc)
-                self.studio.log(f"[usb] {port} disconnected: {exc}")
+                message = str(exc)
+                if message != self.error:
+                    self.studio.log(f"[usb] {port} disconnected: {message}")
+                self.error = message
             finally:
                 self.connected = False
                 self.streaming = False
@@ -220,9 +226,26 @@ class UsbFrameTransport:
                 next_due = time.monotonic()
                 continue
 
-            device.write(server.frame_bytes())
+            packet = memoryview(server.frame_bytes())
+            ack_before = self.frames_acked
+            for offset in range(0, len(packet), USB_WRITE_CHUNK):
+                device.write(packet[offset : offset + USB_WRITE_CHUNK])
             device.flush()
             self.frames_sent += 1
+
+            ack_deadline = time.monotonic() + USB_ACK_TIMEOUT_S
+            while (
+                not self.stop_event.is_set()
+                and not self.pause_event.is_set()
+                and self.frames_acked == ack_before
+                and time.monotonic() < ack_deadline
+            ):
+                self._read_status(device)
+                self.stop_event.wait(0.01)
+            if self.frames_acked == ack_before:
+                raise serial.SerialTimeoutException(
+                    "Pico did not acknowledge the completed USB frame"
+                )
             self.streaming = True
 
             next_due += interval
@@ -480,7 +503,7 @@ class Studio(tk.Tk):
         srv = self.server
         try:
             srv.serve_forever()
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             self.logq.put(f"[!] server stopped: {exc}\n")
         finally:
             if self.server is srv:
@@ -704,6 +727,19 @@ def _to_ppm(frame: np.ndarray) -> bytes:
 
 
 def main() -> None:
+    global _INSTANCE_MUTEX
+    if sys.platform == "win32":
+        _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(
+            None, False, "Local\\PicoDviArtStudio"
+        )
+        if ctypes.windll.kernel32.GetLastError() == 183:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "Pico DVI Art Studio is already running.",
+                "Pico DVI Art Studio",
+                0x40,
+            )
+            return
     Studio().mainloop()
 
 

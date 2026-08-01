@@ -314,10 +314,18 @@ class RetroArcadeEngine:
             y = int(10 + math.sin(x * 0.13 + t) * 5)
             self._rect(frame, x, y, 10, 2, self._palette(x // 13))
 
-    def render(self, t: float) -> np.ndarray:
-        t = float(t) * self.speed
-        scene = int(t // self.SCENE_SECONDS) % 5
-        local_t = t % self.SCENE_SECONDS
+    def _particles(self, frame: np.ndarray, scene: int, t: float) -> None:
+        h, w = frame.shape[:2]
+        for index in range(22):
+            phase = index * 17 + self.seed % 97
+            x = int((phase * 3 + t * (8 + scene * 2 + index % 4)) % w)
+            y = int((phase * 5 + math.sin(t * 1.7 + index) * 13) % h)
+            size = 1 + ((index + scene) % 2)
+            color = self._palette(index + scene + int(t * 0.5))
+            self._rect(frame, x + 1, y + 1, size, size, (5, 4, 18))
+            self._rect(frame, x, y, size, size, color)
+
+    def _render_scene(self, scene: int, local_t: float) -> np.ndarray:
         frame = self._background(scene, local_t)
         renderers = (
             self._falling_blocks,
@@ -327,6 +335,26 @@ class RetroArcadeEngine:
             self._ice_climb,
         )
         renderers[scene](frame, local_t)
+        self._particles(frame, scene, local_t)
+        return frame
+
+    def render(self, t: float) -> np.ndarray:
+        t = float(t) * self.speed
+        scene = int(t // self.SCENE_SECONDS) % 5
+        local_t = t % self.SCENE_SECONDS
+        frame = self._render_scene(scene, local_t)
+
+        # Spend extra host compute on a smooth pixel-dithered transition rather
+        # than hard-cutting between games.
+        transition_start = self.SCENE_SECONDS - 2.0
+        if local_t > transition_start:
+            mix = (local_t - transition_start) / 2.0
+            incoming = self._render_scene((scene + 1) % 5, local_t - transition_start)
+            threshold = int(np.clip(mix, 0.0, 1.0) * 16)
+            yy, xx = np.mgrid[0 : frame.shape[0], 0 : frame.shape[1]]
+            dither = ((xx & 3) + ((yy & 3) << 2)) < threshold
+            frame[dither] = incoming[dither]
+
         return np.repeat(np.repeat(frame, 2, axis=0), 2, axis=1)[
             : self.height, : self.width
         ]

@@ -208,5 +208,17 @@ def render_centered_hud(rgb: np.ndarray, state: HudState, cfg) -> np.ndarray:
             rgb, text, center_x, y, scale, color, align="center",
             shadow=(3, 4, 12),
         )
+        if index == 0:
+            clock_width = text_size(text, scale, TRACKING)[0]
+            line_width = min(58, max(24, clock_width // 2))
+            line_x = center_x - line_width // 2
+            line_y = min(rgb.shape[0] - 2, y + heights[0] + 1)
+            rgb[line_y : line_y + 2, line_x : line_x + line_width] = (
+                255, 196, 18
+            )
+            spark = int((now.second % 10) / 10.0 * max(1, line_width - 8))
+            rgb[line_y : line_y + 2, line_x + spark : line_x + spark + 8] = (
+                255, 255, 170
+            )
         y += heights[index] + (gaps[index] if index < len(gaps) else 0)
     return rgb
