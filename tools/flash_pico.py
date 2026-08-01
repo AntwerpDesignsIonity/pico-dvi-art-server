@@ -54,6 +54,23 @@ MICROPYTHON = "micropython"
 FOREIGN = "foreign"
 
 
+def is_raspberry_pi_port(port: str) -> bool:
+    """True only for a Raspberry Pi USB device.
+
+    Other boards - ESP32s, Arduinos, USB-serial adapters - share the same COM
+    namespace, and a 1200-baud touch or a REPL command aimed at one of them can
+    knock it offline. Nothing here may act on a port that fails this check.
+    """
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return False
+    for info in list_ports.comports():
+        if info.device.upper() == port.upper():
+            return info.vid == RPI_VID
+    return False
+
+
 class Board:
     def __init__(self, port: str, serial: str = "", pid: int = 0):
         self.port = port
@@ -195,11 +212,26 @@ def latest_uf2_url(board: str = DEFAULT_BOARD) -> str:
 
 
 def reboot_to_bootsel(port: str) -> Path | None:
-    """Ask a running board to enter BOOTSEL by touching the port at 1200 baud.
+    """Ask a running board to enter BOOTSEL, whatever firmware it is running.
 
-    Most RP2040/RP2350 USB-CDC firmware implements this Arduino-style reset. It
-    fails harmlessly on firmware that does not.
+    A 1200-baud touch is the Arduino/CircuitPython convention and is what the
+    C firmware and most vendor firmware honour. MicroPython ignores it entirely
+    and needs machine.bootloader() over the REPL instead, so try both.
     """
+
+    def wait_for_drive(seconds: int) -> Path | None:
+        for _ in range(seconds * 2):
+            time.sleep(0.5)
+            drives = find_bootsel_drives()
+            if drives:
+                print(f"[bootsel] board is now in BOOTSEL at {drives[0]}")
+                return drives[0]
+        return None
+
+    if not is_raspberry_pi_port(port):
+        print(f"[bootsel] refusing to touch {port} - it is not a Raspberry Pi device")
+        return None
+
     print(f"[bootsel] asking {port} to enter BOOTSEL (1200-baud touch)")
     try:
         import serial
@@ -213,12 +245,19 @@ def reboot_to_bootsel(port: str) -> Path | None:
         # exception even though the reset succeeded. Check for the drive anyway.
         print(f"[bootsel] port closed abruptly ({type(exc).__name__}) - checking for the drive")
 
-    for _ in range(12):
-        time.sleep(1)
-        drives = find_bootsel_drives()
-        if drives:
-            print(f"[bootsel] board is now in BOOTSEL at {drives[0]}")
-            return drives[0]
+    drive = wait_for_drive(6)
+    if drive:
+        return drive
+
+    print(f"[bootsel] no response - trying machine.bootloader() on {port}")
+    try:
+        mp(port, "exec", "import machine;machine.bootloader()", timeout=20)
+    except Exception:
+        pass  # the board vanishing mid-command is the expected success path
+    drive = wait_for_drive(8)
+    if drive:
+        return drive
+
     print("[bootsel] the board did not enter BOOTSEL - use the BOOTSEL button")
     return None
 

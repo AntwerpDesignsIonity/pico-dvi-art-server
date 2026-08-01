@@ -25,7 +25,9 @@ class Config:
     port: int = 5001
 
     # --- framebuffer ---
-    width: int = 400
+    # 320x240 is what the PICO-DVI-LCD carrier shows: the RP2350 emits
+    # 640x480p60 over DVI and pixel-doubles this buffer into it.
+    width: int = 320
     height: int = 240
     byte_order: str = "little"  # "little" or "big" - must match the driver
     fps: float = 20.0

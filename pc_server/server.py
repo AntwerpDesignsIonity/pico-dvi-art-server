@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import select
 import socket
 import struct
 import sys
@@ -55,6 +56,9 @@ class ClientSession:
     client_fps: float | None = None
     last_seen: float = field(default_factory=time.time)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Frames and OTA commands are written from different threads; without this
+    # a command could be spliced into the middle of a frame payload.
+    send_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def snapshot(self) -> tuple[float | None, str]:
         with self.lock:
@@ -179,9 +183,13 @@ class ArtServer:
         started = time.monotonic()
         next_due = time.monotonic()
         try:
-            conn.settimeout(15.0)
+            # No overall socket timeout: a frame that takes a while to drain is
+            # normal backpressure from a client slower than cfg.fps, not a
+            # fault. _send_frame() enforces a *stall* timeout instead, so we
+            # only drop a client that has genuinely stopped reading.
+            conn.settimeout(None)
             while not self._stop.is_set():
-                conn.sendall(self.frame_bytes(session))
+                self._send_frame(conn, self.frame_bytes(session), session.send_lock)
                 sent += 1
                 if sent % 200 == 0:
                     elapsed = time.monotonic() - started
@@ -206,6 +214,26 @@ class ArtServer:
             except OSError:
                 pass
             print(f"[-] client disconnected: {addr[0]} after {sent} frames")
+
+    # A Pico that is drawing every frame it receives is allowed to be slower
+    # than cfg.fps - TCP backpressure just makes send() wait. Only a client
+    # that accepts nothing at all for this long is considered dead.
+    STALL_TIMEOUT_S = 20.0
+
+    def _send_frame(
+        self, conn: socket.socket, payload: bytes, lock: threading.Lock
+    ) -> None:
+        view = memoryview(payload)
+        offset = 0
+        # Held for the whole frame: an OTA command written between two chunks
+        # would land inside the payload and desync the client's parser.
+        with lock:
+            while offset < len(view):
+                if not select.select([], [conn], [], self.STALL_TIMEOUT_S)[1]:
+                    raise socket.timeout(
+                        f"client accepted no data for {self.STALL_TIMEOUT_S:g}s"
+                    )
+                offset += conn.send(view[offset:])
 
     def _uplink_reader(self, conn: socket.socket, session: ClientSession) -> None:
         buffer = b""
@@ -255,9 +283,10 @@ class ArtServer:
         delivered = 0
         with self._clients_lock:
             targets = list(self._clients)
-        for _session, conn in targets:
+        for session, conn in targets:
             try:
-                conn.sendall(packet)
+                with session.send_lock:
+                    conn.sendall(packet)
                 delivered += 1
             except OSError:
                 continue

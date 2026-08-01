@@ -16,6 +16,11 @@ received.png
 
 # Device credentials - MUST NEVER BE COMMITTED (the repo is public for raw OTA)
 pico_firmware/device_secrets.py
+pico_firmware_c/wifi_config.h
+
+# C firmware build trees (CMake/Ninja output, hundreds of MB of objects)
+pico_firmware_c/build/
+pico_firmware_c/build-*/
 
 # Pico OTA leftovers (only ever exist on the device, never in the repo)
 *.bak

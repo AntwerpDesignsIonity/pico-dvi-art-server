@@ -1,0 +1,613 @@
+/*
+ * pico-dvi-art client - C firmware for a Pico 2 W (RP2350) in a
+ * Waveshare PICO-DVI-LCD carrier.
+ *
+ * Why C and not MicroPython/CircuitPython:
+ *   The carrier wires DVI to GP8-GP15. On RP2350 the HSTX peripheral only
+ *   exists on GP12-GP19, so CircuitPython's picodvi (HSTX-only on RP2350)
+ *   physically cannot drive it. PicoDVI generates DVI with PIO, which works
+ *   on any pins - and its picodvi_dvi_cfg is an exact match for this board.
+ *
+ * Mode: 640x480p60 DVI carrying a pixel-doubled 320x240 RGB565 framebuffer,
+ * which is the same mode Waveshare's own hello_dvi demo uses on this panel.
+ *
+ * Split across the two cores:
+ *   core1 - TMDS encode + DMA (dvi_scanbuf_main_16bpp), never blocked
+ *   core0 - hands scanlines to core1, and services Wi-Fi. lwIP runs in
+ *           threadsafe-background mode, so incoming pixels land in the back
+ *           buffer from IRQ context while core0 is busy scanning out.
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "pico/cyw43_arch.h"
+#include "pico/bootrom.h"
+#include "hardware/clocks.h"
+#include "hardware/vreg.h"
+#include "hardware/adc.h"
+#include "hardware/watchdog.h"
+
+#include "lwip/tcp.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/netif.h"
+
+#include "dvi.h"
+#include "dvi_serialiser.h"
+#include "common_dvi_pin_configs.h"
+
+#include "wifi_config.h"
+
+// Diagnostic build switch: skip the DVI overclock and scan-out entirely, to
+// separate wireless problems from display problems.
+#ifndef DIAG_SKIP_OVERCLOCK
+#define DIAG_SKIP_OVERCLOCK 0
+#endif
+
+// ---------------------------------------------------------------- display
+#define FRAME_WIDTH   320
+#define FRAME_HEIGHT  240
+#define FRAME_PIXELS  (FRAME_WIDTH * FRAME_HEIGHT)
+#define FRAME_BYTES   (FRAME_PIXELS * 2)
+
+#define VREG_VSEL     VREG_VOLTAGE_1_20
+#define DVI_TIMING    dvi_timing_640x480p_60hz
+
+// One join attempt must fit inside the watchdog window, and the watchdog itself
+// is capped at roughly 8.3s by the hardware counter.
+#define WATCHDOG_TIMEOUT_MS 8000
+#define JOIN_TIMEOUT_MS     20000
+#define WIFI_BACKOFF_MIN_MS 3000
+#define WIFI_BACKOFF_MAX_MS 60000
+
+struct dvi_inst dvi0;
+static bool dvi_running = false;
+
+// Two framebuffers: core0 scans one out while the network fills the other.
+static uint16_t framebuf[2][FRAME_PIXELS];
+static volatile uint8_t front_idx = 0;
+static volatile bool frame_ready = false;   // back buffer holds a complete frame
+
+static inline uint16_t *front_buffer(void) { return framebuf[front_idx]; }
+static inline uint16_t *back_buffer(void)  { return framebuf[front_idx ^ 1]; }
+
+// ---------------------------------------------------------------- protocol
+static const uint8_t MAGIC_FRAME[4]   = {0xAA, 0xBB, 0xCC, 0xDD};
+static const uint8_t MAGIC_COMMAND[4] = {0xAA, 0xBB, 0xCC, 0xEE};
+#define HEADER_SIZE 8
+
+enum rx_state { RX_HEADER, RX_FRAME, RX_COMMAND, RX_DISCARD };
+
+static struct {
+    enum rx_state state;
+    uint8_t  header[HEADER_SIZE];
+    uint32_t header_got;
+    uint32_t payload_len;
+    uint32_t payload_got;
+    uint8_t  command[256];
+    uint32_t frames;
+    uint32_t drops;
+} rx;
+
+static struct tcp_pcb *client_pcb = NULL;
+static volatile bool link_up = false;
+static volatile bool reboot_to_bootsel = false;
+static volatile bool reboot_requested = false;
+
+// ---------------------------------------------------------------- helpers
+static float chip_temperature(void) {
+    adc_select_input(4);
+    // 12-bit conversion over the 3.3V reference, per the RP2350 datasheet.
+    const float conversion = 3.3f / (1 << 12);
+    float volts = adc_read() * conversion;
+    return 27.0f - (volts - 0.706f) / 0.001721f;
+}
+
+static const char *ip_string(void) {
+    if (!netif_default) return "0.0.0.0";
+    return ip4addr_ntoa(netif_ip4_addr(netif_default));
+}
+
+// Fingerprint the credentials rather than printing them: this proves whether
+// the strings reaching the radio are byte-identical to the ones on the PC,
+// without ever putting a password on the wire or in a log.
+static uint32_t str_fingerprint(const char *s) {
+    uint32_t hash = 2166136261u;
+    while (*s) {
+        hash ^= (uint8_t)*s++;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+// Strongest BSS advertising our SSID, learned from a scan. This network is a
+// mesh with several BSSIDs spread over channels 1 and 8; letting the firmware
+// pick one is a lottery that frequently lands on a distant node and gets the
+// association refused. Aiming at a specific BSSID + channel makes the join
+// deterministic.
+static uint8_t best_bssid[6];
+static int     best_rssi;
+static uint32_t best_channel;
+static bool    best_valid;
+
+static int on_scan_result(void *env, const cyw43_ev_scan_result_t *result) {
+    (void)env;
+    if (!result) return 0;
+    printf("[scan] %-32.*s rssi %4d chan %3d auth %u\n",
+           result->ssid_len, result->ssid, result->rssi,
+           result->channel, result->auth_mode);
+    if (result->ssid_len == strlen(WIFI_SSID) &&
+        !memcmp(result->ssid, WIFI_SSID, result->ssid_len) &&
+        (!best_valid || result->rssi > best_rssi)) {
+        memcpy(best_bssid, result->bssid, sizeof(best_bssid));
+        best_rssi = result->rssi;
+        best_channel = result->channel;
+        best_valid = true;
+    }
+    return 0;
+}
+
+// A scan proves whether the radio and its SPI bus are healthy: if the AP shows
+// up with a sane RSSI then a failed join is genuinely about credentials, not
+// about the wireless chip being starved or overclocked. It also picks the
+// BSSID that wifi_join() will aim at.
+static void wifi_scan(void) {
+    cyw43_wifi_scan_options_t options = {0};
+    printf("[scan] looking for networks\n");
+    best_valid = false;
+    cyw43_arch_lwip_begin();
+    int rc = cyw43_wifi_scan(&cyw43_state, &options, NULL, on_scan_result);
+    cyw43_arch_lwip_end();
+    if (rc != 0) {
+        printf("[scan] could not start (rc %d)\n", rc);
+        return;
+    }
+    absolute_time_t deadline = make_timeout_time_ms(12000);
+    while (cyw43_wifi_scan_active(&cyw43_state) &&
+           absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
+        watchdog_update();
+        sleep_ms(200);
+    }
+    if (best_valid) {
+        printf("[scan] best '%s' at %02x:%02x:%02x:%02x:%02x:%02x "
+               "rssi %d chan %lu\n", WIFI_SSID,
+               best_bssid[0], best_bssid[1], best_bssid[2],
+               best_bssid[3], best_bssid[4], best_bssid[5],
+               best_rssi, (unsigned long)best_channel);
+    } else {
+        printf("[scan] '%s' not found\n", WIFI_SSID);
+    }
+    printf("[scan] done\n");
+}
+
+static const char *link_name(int status) {
+    switch (status) {
+        case CYW43_LINK_DOWN:    return "down";
+        case CYW43_LINK_JOIN:    return "joining";
+        case CYW43_LINK_NOIP:    return "no-ip";
+        case CYW43_LINK_UP:      return "up";
+        case CYW43_LINK_FAIL:    return "fail";
+        case CYW43_LINK_NONET:   return "no-net";
+        case CYW43_LINK_BADAUTH: return "badauth";
+        default:                 return "?";
+    }
+}
+
+// Do NOT use cyw43_arch_wifi_connect_*_ms() here. That helper polls with
+// `while (status >= 0)`, so it bails out the instant the driver reports a
+// transient CYW43_LINK_BADAUTH (-3). On a multi-AP/mesh SSID (this network
+// advertises several BSSIDs) the first association attempt is routinely
+// refused while the controller steers the client, and the driver itself
+// expects that - cyw43_ctrl.c turns a BADAUTH back into ACTIVE when a good
+// AUTH follows it. MicroPython connects on this exact network because its
+// connect() is async and the caller tolerates the bounce, so mirror that:
+// issue one join and then poll patiently.
+//
+// Deliberately ONE attempt per call, always WPA2-AES (the scan reports auth 5
+// = WPA2 for every BSS). Hammering an AP with back-to-back association
+// requests - especially cycling auth modes - gets the MAC rate-limited, which
+// turns a recoverable BADAUTH into a solid wall of refusals. The caller backs
+// off between calls instead.
+static bool wifi_join(uint32_t timeout_ms) {
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    int last_status = 0xFF;
+
+    // Drop any half-open association left over from a previous attempt or a
+    // reboot, otherwise the AP still has us on its client list and refuses the
+    // new request.
+    cyw43_arch_lwip_begin();
+    cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+    cyw43_arch_lwip_end();
+    sleep_ms(200);
+    watchdog_update();
+
+    // Plain join: no BSSID, no channel. Aiming at a specific BSSID makes the
+    // firmware report NONET on this mesh even when that BSS is 38 dBm away, so
+    // let the chip pick the node and rely on the patient poll below plus the
+    // caller's back-off to ride out a refusal.
+    int rc;
+    cyw43_arch_lwip_begin();
+    rc = cyw43_wifi_join(&cyw43_state,
+                         strlen(WIFI_SSID), (const uint8_t *)WIFI_SSID,
+                         strlen(WIFI_PASS), (const uint8_t *)WIFI_PASS,
+                         CYW43_AUTH_WPA2_AES_PSK, NULL, CYW43_CHANNEL_NONE);
+    cyw43_arch_lwip_end();
+    printf("[wifi] join requested (rc %d)\n", rc);
+    if (rc != 0) return false;
+
+    while (absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
+        watchdog_update();
+        cyw43_arch_poll();
+        int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+        if (status != last_status) {
+            printf("[wifi] link %s (%d)\n", link_name(status), status);
+            last_status = status;
+        }
+        if (status == CYW43_LINK_UP) {
+            printf("[wifi] joined '%s' as %s\n", WIFI_SSID, ip_string());
+            return true;
+        }
+        sleep_ms(100);
+    }
+
+    printf("[wifi] no link after %lu ms\n", (unsigned long)timeout_ms);
+    return false;
+}
+
+static void send_line(const char *text) {    if (!client_pcb || !link_up) return;
+    size_t len = strlen(text);
+    cyw43_arch_lwip_begin();
+    if (tcp_sndbuf(client_pcb) >= len) {
+        tcp_write(client_pcb, text, len, TCP_WRITE_FLAG_COPY);
+        tcp_output(client_pcb);
+    }
+    cyw43_arch_lwip_end();
+}
+
+static void handle_command(const uint8_t *payload, uint32_t len) {
+    char buf[257];
+    uint32_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    memcpy(buf, payload, n);
+    buf[n] = '\0';
+    printf("[cmd] %s\n", buf);
+
+    // The C firmware cannot rewrite its own flash, so an OTA request drops the
+    // board into BOOTSEL instead. The PC-side watcher sees the RPI-RP2 drive
+    // appear and copies the new .uf2 across - same outcome, fully automatic.
+    if (strstr(buf, "\"ota\"")) {
+        reboot_to_bootsel = true;
+    } else if (strstr(buf, "\"reboot\"")) {
+        reboot_requested = true;
+    }
+}
+
+// ---------------------------------------------------------------- rx parse
+static void consume(const uint8_t *data, uint32_t len) {
+    while (len > 0) {
+        switch (rx.state) {
+        case RX_HEADER: {
+            uint32_t want = HEADER_SIZE - rx.header_got;
+            uint32_t take = len < want ? len : want;
+            memcpy(rx.header + rx.header_got, data, take);
+            rx.header_got += take;
+            data += take;
+            len  -= take;
+            if (rx.header_got < HEADER_SIZE) return;
+
+            rx.header_got = 0;
+            rx.payload_got = 0;
+            rx.payload_len = (uint32_t)rx.header[4]
+                           | ((uint32_t)rx.header[5] << 8)
+                           | ((uint32_t)rx.header[6] << 16)
+                           | ((uint32_t)rx.header[7] << 24);
+
+            if (!memcmp(rx.header, MAGIC_FRAME, 4)) {
+                // Wrong geometry: swallow it rather than corrupt the framebuffer.
+                rx.state = (rx.payload_len == FRAME_BYTES) ? RX_FRAME : RX_DISCARD;
+                if (rx.state == RX_DISCARD) rx.drops++;
+            } else if (!memcmp(rx.header, MAGIC_COMMAND, 4)) {
+                rx.state = (rx.payload_len <= sizeof(rx.command)) ? RX_COMMAND : RX_DISCARD;
+            } else {
+                rx.drops++;
+                rx.state = RX_DISCARD;
+            }
+            break;
+        }
+        case RX_FRAME: {
+            uint32_t want = rx.payload_len - rx.payload_got;
+            uint32_t take = len < want ? len : want;
+            memcpy((uint8_t *)back_buffer() + rx.payload_got, data, take);
+            rx.payload_got += take;
+            data += take;
+            len  -= take;
+            if (rx.payload_got == rx.payload_len) {
+                rx.frames++;
+                frame_ready = true;      // core0 swaps at the next frame boundary
+                rx.state = RX_HEADER;
+            }
+            break;
+        }
+        case RX_COMMAND: {
+            uint32_t want = rx.payload_len - rx.payload_got;
+            uint32_t take = len < want ? len : want;
+            memcpy(rx.command + rx.payload_got, data, take);
+            rx.payload_got += take;
+            data += take;
+            len  -= take;
+            if (rx.payload_got == rx.payload_len) {
+                handle_command(rx.command, rx.payload_len);
+                rx.state = RX_HEADER;
+            }
+            break;
+        }
+        case RX_DISCARD: {
+            uint32_t want = rx.payload_len - rx.payload_got;
+            uint32_t take = len < want ? len : want;
+            rx.payload_got += take;
+            data += take;
+            len  -= take;
+            if (rx.payload_got == rx.payload_len) rx.state = RX_HEADER;
+            break;
+        }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- lwIP glue
+static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
+    (void)arg;
+    if (!p) {
+        printf("[net] server closed the link\n");
+        link_up = false;
+        return ERR_OK;
+    }
+    if (err != ERR_OK) {
+        pbuf_free(p);
+        return err;
+    }
+    for (struct pbuf *q = p; q != NULL; q = q->next) {
+        consume((const uint8_t *)q->payload, q->len);
+    }
+    tcp_recved(pcb, p->tot_len);
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+static void on_err(void *arg, err_t err) {
+    (void)arg;
+    printf("[net] link error %d\n", err);
+    client_pcb = NULL;
+    link_up = false;
+}
+
+static err_t on_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
+    (void)arg; (void)pcb;
+    if (err != ERR_OK) {
+        printf("[net] connect failed %d\n", err);
+        link_up = false;
+        return err;
+    }
+    printf("[net] linked - streaming pixels\n");
+    link_up = true;
+    rx.state = RX_HEADER;
+    rx.header_got = 0;
+
+    char line[96];
+    snprintf(line, sizeof(line), "HELLO %d %s\n", FIRMWARE_VERSION, DEVICE_ID);
+    send_line(line);
+    snprintf(line, sizeof(line), "TEMP %.2f\n", chip_temperature());
+    send_line(line);
+    return ERR_OK;
+}
+
+static bool connect_to_server(void) {
+    ip_addr_t server;
+    if (!ip4addr_aton(SERVER_IP, &server)) {
+        printf("[net] SERVER_IP '%s' is not a valid address\n", SERVER_IP);
+        return false;
+    }
+    cyw43_arch_lwip_begin();
+    client_pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (!client_pcb) {
+        cyw43_arch_lwip_end();
+        return false;
+    }
+    tcp_recv(client_pcb, on_recv);
+    tcp_err(client_pcb, on_err);
+    printf("[net] connecting to %s:%d\n", SERVER_IP, SERVER_PORT);
+    err_t err = tcp_connect(client_pcb, &server, SERVER_PORT, on_connected);
+    cyw43_arch_lwip_end();
+    return err == ERR_OK;
+}
+
+static void close_link(void) {
+    cyw43_arch_lwip_begin();
+    if (client_pcb) {
+        tcp_recv(client_pcb, NULL);
+        tcp_err(client_pcb, NULL);
+        tcp_abort(client_pcb);
+        client_pcb = NULL;
+    }
+    cyw43_arch_lwip_end();
+    link_up = false;
+}
+
+// ---------------------------------------------------------------- offline
+// Something has to be on the glass when the server is unreachable, otherwise a
+// dark panel is indistinguishable from dead hardware.
+static void draw_standby(uint16_t *buf, uint frame) {
+    for (uint y = 0; y < FRAME_HEIGHT; ++y) {
+        for (uint x = 0; x < FRAME_WIDTH; ++x) {
+            uint v = (x + y + frame) >> 3;
+            uint16_t r = (v & 1) ? 6 : 0;
+            uint16_t g = ((v >> 1) & 1) ? 12 : 0;
+            uint16_t b = ((v >> 2) & 1) ? 10 : 3;
+            buf[y * FRAME_WIDTH + x] = (uint16_t)((r << 11) | (g << 5) | b);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- cores
+static void core1_main(void) {
+    dvi_register_irqs_this_core(&dvi0, DMA_IRQ_0);
+    while (queue_is_empty(&dvi0.q_colour_valid))
+        __wfe();
+    dvi_start(&dvi0);
+    dvi_scanbuf_main_16bpp(&dvi0);
+}
+
+// Push one whole frame worth of scanline pointers at core1.
+static void scan_out_frame(void) {
+    // Without DVI running there is no consumer, and queue_add_blocking would
+    // spin forever - taking USB down with it and leaving the board needing a
+    // physical BOOTSEL. Pace the loop instead so diagnostics stay reachable.
+    if (!dvi_running) {
+        sleep_ms(16);
+        return;
+    }
+    uint16_t *buf = front_buffer();
+    for (uint y = 0; y < FRAME_HEIGHT; ++y) {
+        const uint16_t *scanline = &buf[y * FRAME_WIDTH];
+        queue_add_blocking_u32(&dvi0.q_colour_valid, &scanline);
+        while (queue_try_remove_u32(&dvi0.q_colour_free, &scanline))
+            ;
+    }
+}
+
+int main(void) {
+    // DVI needs a 252MHz system clock, and the CYW43 bus timing is derived from
+    // it, so the clock must be final before the wireless chip is brought up.
+#if !DIAG_SKIP_OVERCLOCK
+    vreg_set_voltage(VREG_VSEL);
+    sleep_ms(10);
+    set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
+#endif
+
+    setup_default_uart();
+    stdio_init_all();
+    adc_init();
+    adc_set_temp_sensor_enabled(true);
+
+    printf("\n[boot] pico-dvi-art client v%d (%s)\n", FIRMWARE_VERSION, DEVICE_ID);
+    printf("[boot] %dx%d RGB565 in 640x480p60 DVI, sys clock %lu kHz\n",
+           FRAME_WIDTH, FRAME_HEIGHT, (unsigned long)(clock_get_hz(clk_sys) / 1000));
+
+    printf("[boot] ssid len %u fp %08lx / pass len %u fp %08lx\n",
+           (unsigned)strlen(WIFI_SSID), (unsigned long)str_fingerprint(WIFI_SSID),
+           (unsigned)strlen(WIFI_PASS), (unsigned long)str_fingerprint(WIFI_PASS));
+
+    memset(framebuf, 0, sizeof(framebuf));
+    draw_standby(framebuf[0], 0);
+
+    // Associate before DVI starts: once core1 is scanning out, the per-scanline
+    // DMA interrupt starves the CYW43 driver during the WPA handshake.
+    if (cyw43_arch_init()) {
+        printf("[wifi] init failed - staying offline\n");
+    } else {
+        cyw43_arch_enable_sta_mode();
+        printf("[wifi] connecting to %s\n", WIFI_SSID);
+        // Join straight away. A scan leaves the radio hopping channels and
+        // makes the association that follows it noticeably less reliable, so
+        // it is only used as a diagnostic after a failure.
+        wifi_join(JOIN_TIMEOUT_MS);
+    }
+
+    dvi0.timing = &DVI_TIMING;
+    dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
+#if !DIAG_SKIP_OVERCLOCK
+    dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
+    multicore_launch_core1(core1_main);
+    dvi_running = true;
+#endif
+
+    // From here on the board must never need a human with a BOOTSEL button: if
+    // anything wedges, the watchdog restarts it. Every blocking path above feeds
+    // the timer, and a whole frame of scan-out takes 16ms, so 8s is generous.
+    watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
+
+    absolute_time_t next_retry = get_absolute_time();
+    uint32_t wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
+    bool scanned_once = false;
+    absolute_time_t next_stat  = make_timeout_time_ms(5000);
+    uint standby_frame = 0;
+    uint32_t shown = 0;
+    absolute_time_t fps_window = get_absolute_time();
+    uint32_t fps_frames = 0;
+    float fps = 0.0f;
+
+    while (true) {
+        watchdog_update();
+        if (reboot_to_bootsel) {
+            printf("[cmd] rebooting into BOOTSEL for a firmware update\n");
+            sleep_ms(50);
+            reset_usb_boot(0, 0);
+        }
+        if (reboot_requested) {
+            printf("[cmd] rebooting\n");
+            sleep_ms(50);
+            watchdog_reboot(0, 0, 0);
+        }
+
+        if (!link_up && absolute_time_diff_us(get_absolute_time(), next_retry) <= 0) {
+            close_link();
+            int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+            printf("[net] retry: wifi status %d, ip %s\n", status, ip_string());
+            bool associated = (status == CYW43_LINK_UP) || wifi_join(JOIN_TIMEOUT_MS);
+            if (associated) {
+                wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
+                connect_to_server();
+                next_retry = make_timeout_time_ms(3000);
+            } else {
+                // Back off exponentially. Association requests fired every few
+                // seconds get the MAC rate-limited by the AP, which is exactly
+                // what turns a transient refusal into a permanent one - so give
+                // the AP room to forget about us. The standby animation keeps
+                // running on the panel meanwhile.
+                if (!scanned_once) {
+                    // One diagnostic sweep so the log shows whether the AP is
+                    // even in range. Repeating it would only disturb the radio
+                    // before the next join.
+                    scanned_once = true;
+                    wifi_scan();
+                }
+                printf("[net] wifi retry in %lu ms\n",
+                       (unsigned long)wifi_backoff_ms);
+                next_retry = make_timeout_time_ms(wifi_backoff_ms);
+                wifi_backoff_ms *= 2;
+                if (wifi_backoff_ms > WIFI_BACKOFF_MAX_MS) {
+                    wifi_backoff_ms = WIFI_BACKOFF_MAX_MS;
+                }
+            }
+        }
+
+
+        if (frame_ready) {
+            frame_ready = false;
+            front_idx ^= 1;               // publish the freshly received frame
+            shown++;
+            fps_frames++;
+        } else if (!link_up) {
+            draw_standby(back_buffer(), standby_frame++);
+            front_idx ^= 1;
+        }
+
+        scan_out_frame();
+
+        if (absolute_time_diff_us(get_absolute_time(), fps_window) <= 0) {
+            fps = fps_frames / 2.0f;
+            fps_frames = 0;
+            fps_window = make_timeout_time_ms(2000);
+        }
+        if (link_up && absolute_time_diff_us(get_absolute_time(), next_stat) <= 0) {
+            char line[96];
+            snprintf(line, sizeof(line), "TEMP %.2f\n", chip_temperature());
+            send_line(line);
+            snprintf(line, sizeof(line), "STAT fps=%.1f drops=%lu\n",
+                     (double)fps, (unsigned long)rx.drops);
+            send_line(line);
+            next_stat = make_timeout_time_ms(5000);
+        }
+    }
+}
