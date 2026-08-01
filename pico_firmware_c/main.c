@@ -13,9 +13,8 @@
  *
  * Split across the two cores:
  *   core1 - TMDS encode + DMA (dvi_scanbuf_main_16bpp), never blocked
- *   core0 - hands scanlines to core1, and services Wi-Fi. lwIP runs in
- *           threadsafe-background mode, so incoming pixels land in the back
- *           buffer from IRQ context while core0 is busy scanning out.
+ *   core0 - renders the animation into a local back buffer, hands scanlines
+ *           to core1, and services lightweight Wi-Fi control/telemetry.
  */
 
 #include <stdio.h>
@@ -64,7 +63,6 @@
 #endif
 #define FRAME_HEIGHT  240
 #define FRAME_PIXELS  (FRAME_WIDTH * FRAME_HEIGHT)
-#define FRAME_BYTES   (FRAME_PIXELS * 2)
 
 #define VREG_VSEL     VREG_VOLTAGE_1_20
 
@@ -78,12 +76,6 @@
 // lwIP retransmits an unanswered SYN with a growing backoff; give a connect
 // long enough to survive that before calling it dead.
 #define TCP_CONNECT_WINDOW_MS 12000
-// A mesh node can accept the association and lease an address yet never bridge
-// our traffic onto the LAN: the link reports "up" while every TCP connect dies
-// unanswered. Only re-associating (and, if that keeps happening, power-cycling
-// the radio) can move us onto a node that actually forwards packets.
-#define CONNECT_WINDOWS_BEFORE_REJOIN 4
-#define REJOINS_BEFORE_RADIO_RESET    3
 // The CYW43 defaults to PM2 powersave, where the radio dozes between beacons.
 // Mesh nodes routinely fail to buffer traffic for dozing clients, so ARP for
 // us goes unanswered and the board turns unreachable seconds after it joins.
@@ -93,15 +85,14 @@
 struct dvi_inst dvi0;
 static bool dvi_running = false;
 
-// What the panel should say while it is not streaming. Updated by the network
-// code so a bystander can tell a Wi-Fi problem from a server problem from dead
-// hardware without ever plugging in a laptop.
+// Updated by the network code for the small status overlay.
 static char status_line[48] = "STARTING";
+static char device_line[48] = "IP 0.0.0.0  MCU --.-C";
+static float cached_temperature = 0.0f;
 
-// Two framebuffers: core0 scans one out while the network fills the other.
+// Two framebuffers: core0 scans one out while rendering into the other.
 static uint16_t framebuf[2][FRAME_PIXELS];
 static volatile uint8_t front_idx = 0;
-static volatile bool frame_ready = false;   // back buffer holds a complete frame
 
 static inline uint16_t *front_buffer(void) { return framebuf[front_idx]; }
 static inline uint16_t *back_buffer(void)  { return framebuf[front_idx ^ 1]; }
@@ -111,7 +102,7 @@ static const uint8_t MAGIC_FRAME[4]   = {0xAA, 0xBB, 0xCC, 0xDD};
 static const uint8_t MAGIC_COMMAND[4] = {0xAA, 0xBB, 0xCC, 0xEE};
 #define HEADER_SIZE 8
 
-enum rx_state { RX_HEADER, RX_FRAME, RX_COMMAND, RX_DISCARD };
+enum rx_state { RX_HEADER, RX_COMMAND, RX_DISCARD };
 
 static struct {
     enum rx_state state;
@@ -120,7 +111,7 @@ static struct {
     uint32_t payload_len;
     uint32_t payload_got;
     uint8_t  command[256];
-    uint32_t frames;
+    uint32_t legacy_frames;
     uint32_t drops;
 } rx;
 
@@ -141,6 +132,12 @@ static float chip_temperature(void) {
 static const char *ip_string(void) {
     if (!netif_default) return "0.0.0.0";
     return ip4addr_ntoa(netif_ip4_addr(netif_default));
+}
+
+static void update_device_line(void) {
+    cached_temperature = chip_temperature();
+    snprintf(device_line, sizeof(device_line), "IP %s  MCU %.1fC",
+             ip_string(), (double)cached_temperature);
 }
 
 // Fingerprint the credentials rather than printing them: this proves whether
@@ -357,28 +354,15 @@ static void consume(const uint8_t *data, uint32_t len) {
                            | ((uint32_t)rx.header[7] << 24);
 
             if (!memcmp(rx.header, MAGIC_FRAME, 4)) {
-                // Wrong geometry: swallow it rather than corrupt the framebuffer.
-                rx.state = (rx.payload_len == FRAME_BYTES) ? RX_FRAME : RX_DISCARD;
-                if (rx.state == RX_DISCARD) rx.drops++;
+                // Updated firmware renders locally. Drain legacy frame packets
+                // so an older desktop app cannot overwrite or desynchronise it.
+                rx.legacy_frames++;
+                rx.state = RX_DISCARD;
             } else if (!memcmp(rx.header, MAGIC_COMMAND, 4)) {
                 rx.state = (rx.payload_len <= sizeof(rx.command)) ? RX_COMMAND : RX_DISCARD;
             } else {
                 rx.drops++;
                 rx.state = RX_DISCARD;
-            }
-            break;
-        }
-        case RX_FRAME: {
-            uint32_t want = rx.payload_len - rx.payload_got;
-            uint32_t take = len < want ? len : want;
-            memcpy((uint8_t *)back_buffer() + rx.payload_got, data, take);
-            rx.payload_got += take;
-            data += take;
-            len  -= take;
-            if (rx.payload_got == rx.payload_len) {
-                rx.frames++;
-                frame_ready = true;      // core0 swaps at the next frame boundary
-                rx.state = RX_HEADER;
             }
             break;
         }
@@ -442,15 +426,15 @@ static err_t on_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
         link_up = false;
         return err;
     }
-    printf("[net] linked - streaming pixels\n");
-    snprintf(status_line, sizeof(status_line), "STREAMING");
+    printf("[net] linked - control and telemetry only\n");
+    snprintf(status_line, sizeof(status_line), "LOCAL ART - CONTROL ONLINE");
     link_up = true;
     rx.state = RX_HEADER;
     rx.header_got = 0;
     rx.payload_got = 0;
 
     char line[96];
-    snprintf(line, sizeof(line), "HELLO %d %s\n", FIRMWARE_VERSION, DEVICE_ID);
+    snprintf(line, sizeof(line), "HELLO %d %s LOCAL\n", FIRMWARE_VERSION, DEVICE_ID);
     send_line(line);
     snprintf(line, sizeof(line), "TEMP %.2f\n", chip_temperature());
     send_line(line);
@@ -557,38 +541,57 @@ static void draw_text(uint16_t *buf, int x, int y, const char *s, int scale,
     }
 }
 
-// Something has to be on the glass when the server is unreachable, otherwise a
-// dark panel is indistinguishable from dead hardware.
-static void draw_standby(uint16_t *buf, uint frame) {
+static uint16_t wheel_rgb565(uint8_t hue, uint8_t brightness) {
+    uint8_t region = hue / 43;
+    uint8_t offset = (uint8_t)((hue - region * 43) * 6);
+    uint8_t up = offset;
+    uint8_t down = (uint8_t)(255 - offset);
+    uint8_t r = 0, g = 0, b = 0;
+    switch (region) {
+    case 0: r = 255;  g = up;   break;
+    case 1: r = down; g = 255;  break;
+    case 2: g = 255;  b = up;   break;
+    case 3: g = down; b = 255;  break;
+    case 4: r = up;   b = 255;  break;
+    default:r = 255;  b = down; break;
+    }
+    r = (uint8_t)(((uint16_t)r * brightness) >> 8);
+    g = (uint8_t)(((uint16_t)g * brightness) >> 8);
+    b = (uint8_t)(((uint16_t)b * brightness) >> 8);
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+// Integer-only local renderer: no framebuffer crosses Wi-Fi and no floating
+// point is used in the hot path. At 320x240 this comfortably leaves core0 time
+// to feed DVI and service lwIP.
+static void draw_local_art(uint16_t *buf, uint32_t frame) {
+    int cx = FRAME_WIDTH / 2;
+    int cy = FRAME_HEIGHT / 2;
     for (uint y = 0; y < FRAME_HEIGHT; ++y) {
         for (uint x = 0; x < FRAME_WIDTH; ++x) {
-            uint v = (x + y + frame) >> 3;
-            uint16_t r = (v & 1) ? 6 : 0;
-            uint16_t g = ((v >> 1) & 1) ? 12 : 0;
-            uint16_t b = ((v >> 2) & 1) ? 10 : 3;
-            buf[y * FRAME_WIDTH + x] = (uint16_t)((r << 11) | (g << 5) | b);
+            int dx = (int)x - cx;
+            int dy = (int)y - cy;
+            uint32_t radius = (uint32_t)(dx * dx + dy * dy);
+            uint32_t waves = ((x * 5u + frame * 3u) ^
+                              (y * 7u - frame * 2u) ^
+                              (radius >> 5));
+            uint8_t hue = (uint8_t)(waves + frame + (radius >> 7));
+            uint8_t brightness = (uint8_t)(112 + ((waves >> 2) & 0x7f));
+            buf[y * FRAME_WIDTH + x] = wheel_rgb565(hue, brightness);
         }
     }
 
     const uint16_t white = 0xFFFF;
-    const uint16_t amber = 0xFD20;
-    char line[48];
-
-    // Dark plate behind the text so it stays readable over the animation.
-    for (uint y = 60; y < 160 && y < FRAME_HEIGHT; ++y) {
-        for (uint x = 20; x < FRAME_WIDTH - 20; ++x) {
+    const uint16_t cyan = 0x07FF;
+    for (uint y = 8; y < 50 && y < FRAME_HEIGHT; ++y) {
+        for (uint x = 8; x < FRAME_WIDTH - 8; ++x) {
             buf[y * FRAME_WIDTH + x] = 0x0000;
         }
     }
 
-    draw_text(buf, 30, 70,  "PICO DVI ART", 2, white);
-    draw_text(buf, 30, 96,  status_line, 1, amber);
-    snprintf(line, sizeof(line), "IP %s", ip_string());
-    draw_text(buf, 30, 112, line, 1, white);
-    snprintf(line, sizeof(line), "SERVER %s:%d", SERVER_IP, SERVER_PORT);
-    draw_text(buf, 30, 128, line, 1, white);
-    snprintf(line, sizeof(line), "SSID %s", WIFI_SSID);
-    draw_text(buf, 30, 144, line, 1, white);
+    draw_text(buf, 14, 14, "PICO DVI - LOCAL", 1, white);
+    draw_text(buf, 14, 28, status_line, 1, cyan);
+    draw_text(buf, 14, 40, device_line, 1, white);
 }
 
 // ---------------------------------------------------------------- cores
@@ -631,6 +634,7 @@ int main(void) {
     stdio_init_all();
     adc_init();
     adc_set_temp_sensor_enabled(true);
+    update_device_line();
 
     printf("\n[boot] pico-dvi-art client v%d (%s)\n", FIRMWARE_VERSION, DEVICE_ID);
     printf("[boot] %dx%d RGB565 in %s DVI, sys clock %lu kHz\n",
@@ -643,7 +647,7 @@ int main(void) {
            (unsigned)strlen(WIFI_PASS), (unsigned long)str_fingerprint(WIFI_PASS));
 
     memset(framebuf, 0, sizeof(framebuf));
-    draw_standby(framebuf[0], 0);
+    draw_local_art(framebuf[0], 0);
 
     // Associate before DVI starts: once core1 is scanning out, the per-scanline
     // DMA interrupt starves the CYW43 driver during the WPA handshake.
@@ -684,14 +688,12 @@ int main(void) {
     uint32_t wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
     bool scanned_once = false;
     uint32_t join_failures = 0;
-    uint32_t connect_windows_failed = 0;
-    uint32_t rejoins_without_stream = 0;
     absolute_time_t next_stat  = make_timeout_time_ms(5000);
-    uint standby_frame = 0;
-    uint32_t shown = 0;
+    uint32_t local_frame = 0;
     absolute_time_t fps_window = get_absolute_time();
     uint32_t fps_frames = 0;
     float fps = 0.0f;
+    absolute_time_t next_render = get_absolute_time();
 
     while (true) {
         watchdog_update();
@@ -706,38 +708,15 @@ int main(void) {
             watchdog_reboot(0, 0, 0);
         }
 
-        if (link_up) {
-            connect_windows_failed = 0;
-            rejoins_without_stream = 0;
-        }
-
         if (!link_up && absolute_time_diff_us(get_absolute_time(), next_retry) <= 0) {
             close_link();
             int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
             printf("[net] retry: wifi status %d, ip %s\n", status, ip_string());
 
-            // "Up" is no proof of a working network: a mesh node can associate
-            // us, lease an address and then bridge nothing. When repeated
-            // connect windows die on an allegedly healthy link, drop the
-            // association and let the mesh place us again - and if rejoining
-            // never leads to a stream either, the radio is the next suspect.
-            if (status == CYW43_LINK_UP &&
-                    connect_windows_failed >= CONNECT_WINDOWS_BEFORE_REJOIN) {
-                connect_windows_failed = 0;
-                printf("[net] link up but the server never answers - rejoining wifi\n");
-                snprintf(status_line, sizeof(status_line), "SERVER UNREACHABLE - REJOIN");
-                if (++rejoins_without_stream >= REJOINS_BEFORE_RADIO_RESET) {
-                    rejoins_without_stream = 0;
-                    radio_power_cycle();
-                }
-                status = CYW43_LINK_DOWN;   // force the join below
-            }
-
             bool associated = (status == CYW43_LINK_UP) || wifi_join(JOIN_TIMEOUT_MS);
             if (associated) {
                 wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
                 join_failures = 0;
-                connect_windows_failed++;
                 connect_to_server();
                 // lwIP retransmits the SYN with a growing backoff, so a healthy
                 // but momentarily busy network can take several seconds to
@@ -748,7 +727,7 @@ int main(void) {
                 // Back off exponentially. Association requests fired every few
                 // seconds get the MAC rate-limited by the AP, which is exactly
                 // what turns a transient refusal into a permanent one - so give
-                // the AP room to forget about us. The standby animation keeps
+                // the AP room to forget about us. The local animation keeps
                 // running on the panel meanwhile.
                 if (!scanned_once) {
                     // One diagnostic sweep so the log shows whether the AP is
@@ -780,14 +759,11 @@ int main(void) {
         }
 
 
-        if (frame_ready) {
-            frame_ready = false;
-            front_idx ^= 1;               // publish the freshly received frame
-            shown++;
-            fps_frames++;
-        } else if (!link_up && rx.state != RX_FRAME) {
-            draw_standby(back_buffer(), standby_frame++);
+        if (absolute_time_diff_us(get_absolute_time(), next_render) <= 0) {
+            draw_local_art(back_buffer(), local_frame++);
             front_idx ^= 1;
+            fps_frames++;
+            next_render = delayed_by_ms(next_render, 33);
         }
 
         scan_out_frame();
@@ -799,10 +775,12 @@ int main(void) {
         }
         if (link_up && absolute_time_diff_us(get_absolute_time(), next_stat) <= 0) {
             char line[96];
-            snprintf(line, sizeof(line), "TEMP %.2f\n", chip_temperature());
+            update_device_line();
+            snprintf(line, sizeof(line), "TEMP %.2f\n", (double)cached_temperature);
             send_line(line);
-            snprintf(line, sizeof(line), "STAT fps=%.1f drops=%lu\n",
-                     (double)fps, (unsigned long)rx.drops);
+            snprintf(line, sizeof(line), "STAT fps=%.1f drops=%lu legacy=%lu\n",
+                     (double)fps, (unsigned long)rx.drops,
+                     (unsigned long)rx.legacy_frames);
             send_line(line);
             next_stat = make_timeout_time_ms(5000);
         }

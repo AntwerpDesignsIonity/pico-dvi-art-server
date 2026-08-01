@@ -6,10 +6,10 @@ launch it on a clean machine with nothing but the repo checked out.
 
 It owns everything the appliance needs:
 
-  * the art server, running in-process on a background thread - there is no
+  * the preview/control server, running in-process on a background thread - there is no
     separate console to babysit and no port for anyone to type in,
   * every setting in pc_server/config.py, grouped and validated,
-  * a live preview of exactly the pixels the Pico is being sent,
+  * a desktop preview of the art style generated locally by the Pico,
   * device control: build firmware, flash it, push an OTA update.
 
 Nothing here asks the user to pick a port, an IP or a file path.
@@ -58,7 +58,7 @@ def _find_system_python() -> str | None:
     Ninja and the Pico SDK anyway, so they are only ever run on a dev
     machine that has Python installed regardless of how this app was
     started. Resolved lazily (not at import time) so a frozen build with no
-    system Python installed can still stream art - only Build/OTA need it.
+    system Python installed can still control the device - only Build/OTA need it.
     """
     if not getattr(sys, "frozen", False):
         return sys.executable
@@ -125,7 +125,7 @@ def ensure_firewall_rule(port: int, log) -> None:
         log(f"[firewall] could not run netsh directly: {exc}")
 
     if direct is not None and direct.returncode == 0:
-        log(f"[firewall] opened inbound TCP {port} for the Pico stream")
+        log(f"[firewall] opened inbound TCP {port} for Pico control")
         return
 
     log(
@@ -151,7 +151,7 @@ def ensure_firewall_rule(port: int, log) -> None:
     for _ in range(20):  # give the user a few seconds to click "Yes"
         time.sleep(0.5)
         if _firewall_rule_exists(port):
-            log(f"[firewall] opened inbound TCP {port} for the Pico stream")
+            log(f"[firewall] opened inbound TCP {port} for Pico control")
             return
     log(
         f"[firewall] rule for port {port} still missing - approve the UAC "
@@ -162,9 +162,10 @@ def ensure_firewall_rule(port: int, log) -> None:
 SETTING_GROUPS: list[tuple[str, list[tuple[str, str, str, object]]]] = [
     ("Display", [
         ("dvi_mode", "Panel mode", "choice", sorted(DVI_MODES)),
-        ("fps", "Target frames/second", "float", None),
+        ("dvi_invert_diffpairs", "TMDS polarity (0 normal, 1 inverted)", "choice", [0, 1]),
+        ("fps", "Preview frames/second", "float", None),
     ]),
-    ("Art", [
+    ("Desktop preview", [
         ("source", "Art source", "choice", ["shader", "retro", "ai", "hybrid"]),
         ("speed", "Animation speed", "float", None),
         ("seed", "Seed (blank = random)", "text", None),
@@ -190,7 +191,7 @@ SETTING_GROUPS: list[tuple[str, list[tuple[str, str, str, object]]]] = [
         ("temp_label_server", "Server label", "text", None),
         ("temp_label_local", "Device label", "text", None),
     ]),
-    ("AI images", [
+    ("AI preview", [
         ("ai_enabled", "Enable AI source", "bool", None),
         ("ai_provider", "Provider", "choice", ["openai", "folder"]),
         ("ai_model", "Model", "text", None),
@@ -326,7 +327,8 @@ class UsbDeviceMonitor:
             mode = MODE_STAMP.read_text(encoding="utf-8").strip()
         except OSError:
             mode = ""
-        if not mode.startswith("640x480") or not SAFE_UF2.exists():
+        polarity = self.studio.cfg.dvi_invert_diffpairs
+        if mode != f"640x480|invert={polarity}" or not SAFE_UF2.exists():
             self.studio.log("[usb] building safe 640x480 recovery firmware")
             result = subprocess.run(
                 [
@@ -334,6 +336,8 @@ class UsbDeviceMonitor:
                     str(REPO / "tools" / "build_firmware.py"),
                     "--mode",
                     "640x480",
+                    "--invert-diffpairs",
+                    str(polarity),
                 ],
                 cwd=str(REPO),
                 capture_output=True,
@@ -384,7 +388,9 @@ class Studio(tk.Tk):
         bar = ttk.Frame(self, padding=(10, 8))
         bar.pack(side="top", fill="x")
 
-        self.btn_server = ttk.Button(bar, text="Stop server", command=self.toggle_server)
+        self.btn_server = ttk.Button(
+            bar, text="Stop control server", command=self.toggle_server
+        )
         self.btn_server.pack(side="left")
         ttk.Button(bar, text="Save settings", command=self.save_settings).pack(
             side="left", padx=(8, 0)
@@ -579,7 +585,7 @@ class Studio(tk.Tk):
             target=self._serve, name="art-server", daemon=True
         )
         self.server_thread.start()
-        self.btn_server.configure(text="Stop server")
+        self.btn_server.configure(text="Stop control server")
 
     def _serve(self) -> None:
         srv = self.server
@@ -605,8 +611,8 @@ class Studio(tk.Tk):
         if self.server_thread is not None:
             self.server_thread.join(timeout=4)
         self.server = None
-        self.btn_server.configure(text="Start server")
-        self.log("Server stopped.")
+        self.btn_server.configure(text="Start control server")
+        self.log("Control server stopped.")
 
     # -- device ----------------------------------------------------------
     def _tool_python(self) -> str | None:
@@ -629,7 +635,8 @@ class Studio(tk.Tk):
         if python is None:
             return
         args = [python, str(REPO / "tools" / "build_firmware.py"), "--flash",
-                "--mode", self.cfg.dvi_mode]
+                "--mode", self.cfg.dvi_mode, "--invert-diffpairs",
+                str(self.cfg.dvi_invert_diffpairs)]
         self._run_tool(args, "firmware build + flash", release_usb=True)
 
     def push_ota(self) -> None:
@@ -649,6 +656,7 @@ class Studio(tk.Tk):
             args = [
                 python, str(REPO / "tools" / "build_firmware.py"), "--flash",
                 "--mode", self.cfg.dvi_mode,
+                "--invert-diffpairs", str(self.cfg.dvi_invert_diffpairs),
             ]
             self._run_tool(args, "OTA build + USB flash", release_usb=True)
             return
@@ -661,6 +669,7 @@ class Studio(tk.Tk):
         args = [
             python, str(REPO / "tools" / "build_firmware.py"),
             "--mode", self.cfg.dvi_mode,
+            "--invert-diffpairs", str(self.cfg.dvi_invert_diffpairs),
         ]
         self._run_tool(args, "OTA build", network_ota=True, python=python)
 
@@ -704,6 +713,8 @@ class Studio(tk.Tk):
                             "--flash",
                             "--mode",
                             self.cfg.dvi_mode,
+                            "--invert-diffpairs",
+                            str(self.cfg.dvi_invert_diffpairs),
                         ]
                         proc = subprocess.Popen(
                             flash_args, cwd=str(REPO), stdout=subprocess.PIPE,
@@ -764,9 +775,9 @@ class Studio(tk.Tk):
     def _refresh_status(self) -> None:
         srv = self.server
         if srv is None:
-            self.status.configure(text="server stopped")
-            self.device_label.configure(text="Server stopped.")
-            self.btn_server.configure(text="Start server")
+            self.status.configure(text="control server stopped")
+            self.device_label.configure(text="Control server stopped; Pico art continues locally.")
+            self.btn_server.configure(text="Start control server")
             return
 
         with srv._clients_lock:

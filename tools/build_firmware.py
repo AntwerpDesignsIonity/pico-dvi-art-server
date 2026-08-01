@@ -1,4 +1,4 @@
-"""Build (and optionally flash) the C/DVI firmware for the Pico 2 W.
+"""Build (and optionally flash) the local-render C/DVI firmware for Pico 2 W.
 
 The MicroPython firmware in pico_firmware/ cannot light this panel: the carrier
 wires DVI to GP8-GP15 and no MicroPython build ships a PIO DVI driver. The C
@@ -183,7 +183,7 @@ def write_wifi_config() -> Path:
         "#endif\n",
         encoding="utf-8",
     )
-    log(f"wifi_config.h -> server {secrets['SERVER_IP']}:{secrets['SERVER_PORT']}")
+    log(f"wifi_config.h -> control server {secrets['SERVER_IP']}:{secrets['SERVER_PORT']}")
     return header
 
 
@@ -201,7 +201,7 @@ def shell_through_vcvars(vcvars: str, command: list[str], cwd: Path) -> int:
     return subprocess.call(line, shell=True, cwd=cwd)
 
 
-def build(clean: bool = False, mode: str = "640x480", invert_diffpairs: int = 1) -> Path:
+def build(clean: bool = False, mode: str = "640x480", invert_diffpairs: int = 0) -> Path:
     ensure_sources()
     write_wifi_config()
 
@@ -322,10 +322,9 @@ def main(argv=None) -> int:
     parser.add_argument("--mode", default="640x480", choices=["640x480", "800x480"],
                         help="panel mode: 640x480 (320x240 buffer) or 800x480 (400x240)")
     parser.add_argument(
-        "--invert-diffpairs", type=int, default=1, choices=[0, 1],
-        help="TMDS diff-pair polarity (1=inverted, matches this carrier's "
-             "documented wiring; 0=not - try this if the panel shows a solid "
-             "colour instead of the standby pattern)",
+        "--invert-diffpairs", type=int, default=0, choices=[0, 1],
+        help="TMDS diff-pair polarity (0=normal; try 1 if the panel shows a "
+             "solid colour instead of the local animation)",
     )
     args = parser.parse_args(argv)
 

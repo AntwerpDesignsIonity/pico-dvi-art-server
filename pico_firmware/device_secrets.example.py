@@ -9,7 +9,8 @@
 WIFI_SSID = "YOUR_WIFI_NAME"
 WIFI_PASS = "YOUR_WIFI_PASSWORD"
 
-# Local IP of the PC running pc_server/server.py
+# Local IP of the PC running the optional control/OTA server. Art keeps
+# rendering on the Pico when this PC is off or unreachable.
 SERVER_IP = "192.168.1.10"
 SERVER_PORT = 5001
 

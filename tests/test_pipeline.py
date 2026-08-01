@@ -220,6 +220,13 @@ class ConfigTests(unittest.TestCase):
         cfg.byte_order = "big"
         with self.assertRaises(ValueError):
             cfg.validate()
+        cfg.byte_order = "little"
+        cfg.dvi_invert_diffpairs = 2
+        with self.assertRaises(ValueError):
+            cfg.validate()
+
+    def test_normal_tmds_polarity_is_the_safe_default(self):
+        self.assertEqual(Config().dvi_invert_diffpairs, 0)
 
     def test_ai_source_enables_worker(self):
         cfg = Config()
@@ -321,6 +328,29 @@ class StreamingTests(unittest.TestCase):
     def test_command_broadcast(self):
         delivered = self.server.broadcast_command({"cmd": "ota"})
         self.assertGreaterEqual(delivered, 0)
+
+
+class LocalRenderProtocolTests(unittest.TestCase):
+    def test_local_render_capability_disables_frame_streaming(self):
+        cfg = Config()
+        server = art_server.ArtServer(cfg)
+        server_side, pico_side = socket.socketpair()
+        thread = threading.Thread(
+            target=server._client_thread,
+            args=(server_side, ("local-pico", 5001)),
+            daemon=True,
+        )
+        thread.start()
+
+        pico_side.sendall(b"HELLO 8 pico-test LOCAL\n")
+        pico_side.settimeout(0.4)
+        with self.assertRaises(socket.timeout):
+            pico_side.recv(1)
+
+        server._stop.set()
+        pico_side.close()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":
