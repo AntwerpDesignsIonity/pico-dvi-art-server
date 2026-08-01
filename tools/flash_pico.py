@@ -38,8 +38,16 @@ SECRETS = FIRMWARE_DIR / "device_secrets.py"
 # Files copied to the board. device_secrets.py is generated, not templated.
 FIRMWARE_FILES = ["boot.py", "main.py", "ota.py", "display_driver.py", "config.py", "version.json"]
 
-UF2_INDEX = "https://micropython.org/download/RPI_PICO_W/"
-UF2_PATTERN = re.compile(r'href="(/resources/firmware/RPI_PICO_W-[^"]+\.uf2)"')
+UF2_INDEX = "https://micropython.org/download/{board}/"
+
+# The RP2350 bootloader reports a generic Board-ID, so the chip family is all we
+# can read from the drive. Both families are matched to their wireless build:
+# this firmware needs Wi-Fi, and the wireless builds are supersets for our use.
+CHIP_TO_BOARD = {
+    "RP2350": "RPI_PICO2_W",
+    "RP2040": "RPI_PICO_W",
+}
+DEFAULT_BOARD = "RPI_PICO_W"
 
 BOOTSEL = "bootsel"
 MICROPYTHON = "micropython"
@@ -71,6 +79,20 @@ def run(cmd: list[str], timeout: float = 60) -> subprocess.CompletedProcess:
 
 def mpremote(*args: str, timeout: float = 60) -> subprocess.CompletedProcess:
     return run([sys.executable, "-m", "mpremote", *args], timeout=timeout)
+
+
+def mp(port: str, *args: str, timeout: float = 60) -> subprocess.CompletedProcess:
+    """Talk to a board, preferring not to reset it.
+
+    Plain `mpremote connect` soft-resets first, which restarts boot.py. Once our
+    firmware is installed that boot blocks on Wi-Fi, so the reset locks us out of
+    the REPL forever. `resume` skips the reset and interrupts the running program
+    instead; we only fall back to the resetting form if that fails.
+    """
+    result = mpremote("connect", port, "resume", *args, timeout=timeout)
+    if result.returncode == 0:
+        return result
+    return mpremote("connect", port, *args, timeout=timeout)
 
 
 def ensure_tooling() -> None:
@@ -108,11 +130,9 @@ def find_bootsel_drives() -> list[Path]:
 
 def probe_port(port: str) -> tuple[str, str]:
     """Return (state, details) for a serial port without modifying the board."""
-    result = mpremote(
-        "connect", port, "exec", "import sys;print(sys.implementation.name)", timeout=25
-    )
+    result = mp(port, "exec", "import sys;print(sys.implementation.name)", timeout=25)
     if "micropython" in (result.stdout or "").lower():
-        info = mpremote("connect", port, "exec", "import os;print(os.uname().release)", timeout=25)
+        info = mp(port, "exec", "import os;print(os.uname().release)", timeout=25)
         return MICROPYTHON, f"MicroPython {info.stdout.strip()}"
 
     # Not a REPL. Capture whatever it is emitting so the user can recognise it.
@@ -148,20 +168,66 @@ def discover(skip_probe: bool = False) -> list[Board]:
 
 
 # ------------------------------------------------------------- micropython
-def latest_uf2_url() -> str:
-    with urllib.request.urlopen(UF2_INDEX, timeout=30) as response:
+def board_from_drive(drive: Path) -> str:
+    """Map a BOOTSEL drive to the MicroPython board name via INFO_UF2.TXT."""
+    try:
+        info = (drive / "INFO_UF2.TXT").read_text(errors="replace")
+    except OSError:
+        return DEFAULT_BOARD
+    for chip, name in CHIP_TO_BOARD.items():
+        if chip in info:
+            return name
+    return DEFAULT_BOARD
+
+
+def latest_uf2_url(board: str = DEFAULT_BOARD) -> str:
+    index = UF2_INDEX.format(board=board)
+    with urllib.request.urlopen(index, timeout=30) as response:
         html = response.read().decode("utf-8", "replace")
-    matches = UF2_PATTERN.findall(html)
+    pattern = re.compile(r'href="(/resources/firmware/' + re.escape(board) + r'-[^"]+\.uf2)"')
+    matches = pattern.findall(html)
     if not matches:
-        raise RuntimeError("could not find a MicroPython .uf2 link on micropython.org")
-    # The page lists newest first; prefer a stable release over a preview build.
-    stable = [m for m in matches if "preview" not in m]
+        raise RuntimeError(f"could not find a MicroPython .uf2 link for {board}")
+    # The page lists newest first. Skip preview builds and the RISC-V variant:
+    # the Arm build is the one every published RP2350 example targets.
+    stable = [m for m in matches if "preview" not in m and "riscv" not in m.lower()]
     return "https://micropython.org" + (stable or matches)[0]
 
 
+def reboot_to_bootsel(port: str) -> Path | None:
+    """Ask a running board to enter BOOTSEL by touching the port at 1200 baud.
+
+    Most RP2040/RP2350 USB-CDC firmware implements this Arduino-style reset. It
+    fails harmlessly on firmware that does not.
+    """
+    print(f"[bootsel] asking {port} to enter BOOTSEL (1200-baud touch)")
+    try:
+        import serial
+
+        handle = serial.Serial(port, 1200)
+        handle.dtr = False
+        time.sleep(0.3)
+        handle.close()
+    except Exception as exc:
+        # The board often yanks the USB device mid-call, which surfaces as an
+        # exception even though the reset succeeded. Check for the drive anyway.
+        print(f"[bootsel] port closed abruptly ({type(exc).__name__}) - checking for the drive")
+
+    for _ in range(12):
+        time.sleep(1)
+        drives = find_bootsel_drives()
+        if drives:
+            print(f"[bootsel] board is now in BOOTSEL at {drives[0]}")
+            return drives[0]
+    print("[bootsel] the board did not enter BOOTSEL - use the BOOTSEL button")
+    return None
+
+
 def install_micropython(drive: Path, dry_run: bool = False) -> None:
-    url = latest_uf2_url()
+    board = board_from_drive(drive)
+    url = latest_uf2_url(board)
     name = url.rsplit("/", 1)[-1]
+    print(f"[uf2] board detected as {board}")
     print(f"[uf2] latest firmware: {name}")
     if dry_run:
         print(f"[dry-run] would copy {name} to {drive}")
@@ -270,28 +336,36 @@ GITHUB_BRANCH = "main"
 
 # -------------------------------------------------------------------- copy
 def copy_firmware(port: str, dry_run: bool = False) -> bool:
-    files = FIRMWARE_FILES + [SECRETS.name]
+    # Order matters. boot.py is written last: the moment it exists the board can
+    # reset into firmware that blocks on Wi-Fi, and anything not yet copied would
+    # be stranded. device_secrets.py goes first so the board never boots with
+    # placeholder credentials.
+    files = [SECRETS.name, "version.json", "config.py", "ota.py",
+             "display_driver.py", "main.py", "boot.py"]
+    files += [f for f in FIRMWARE_FILES if f not in files]
+
     missing = [f for f in files if not (FIRMWARE_DIR / f).exists()]
     if missing:
         print(f"[copy] missing files: {', '.join(missing)}")
         return False
 
     print(f"\n[copy] sending {len(files)} files to {port}")
-    for name in files:
-        source = FIRMWARE_DIR / name
-        if dry_run:
-            print(f"  [dry-run] {name} ({source.stat().st_size} B)")
-            continue
-        result = mpremote("connect", port, "fs", "cp", str(source), f":{name}", timeout=90)
-        status = "ok" if result.returncode == 0 else "FAILED"
-        print(f"  {name:<22} {source.stat().st_size:>7} B  {status}")
-        if result.returncode != 0:
-            print(result.stderr.strip()[:400])
-            return False
     if dry_run:
+        for name in files:
+            print(f"  [dry-run] {name} ({(FIRMWARE_DIR / name).stat().st_size} B)")
         return True
 
-    listing = mpremote("connect", port, "fs", "ls", timeout=45)
+    # One invocation, one REPL entry: a per-file loop re-resets the board between
+    # files and loses the REPL as soon as boot.py has landed.
+    sources = [str(FIRMWARE_DIR / name) for name in files]
+    result = mp(port, "fs", "cp", *sources, ":", timeout=180)
+    if result.returncode != 0:
+        print((result.stderr or "").strip()[-500:])
+        return False
+    for name in files:
+        print(f"  {name:<22} {(FIRMWARE_DIR / name).stat().st_size:>7} B  ok")
+
+    listing = mp(port, "fs", "ls", timeout=45)
     on_board = listing.stdout
     absent = [f for f in files if f not in on_board]
     if absent:
@@ -325,18 +399,28 @@ def choose_target(boards: list[Board], force: bool) -> Board | None:
     print("!" * 72)
     if not force:
         return None
-    print("\n[force] --force given: continuing against a foreign board")
-    return foreign[0]
+
+    victim = foreign[0]
+    print("\n[force] --force given: erasing the firmware on " + victim.port)
+    drive = reboot_to_bootsel(victim.port)
+    if drive is None:
+        return None
+    entered = Board(str(drive))
+    entered.state = BOOTSEL
+    entered.details = "mass storage"
+    return entered
 
 
 def board_firmware_version(port: str) -> str | None:
     """Read version.json from the board; None if absent/unreadable."""
-    result = mpremote(
-        "connect", port, "exec",
-        "import json\ntry:\n print('V=' + json.load(open('version.json'))['version'])\n"
-        "except Exception:\n print('V=')",
+    result = mp(
+        port, "exec",
+        "import json,os;print('V=' + (str(json.load(open('version.json'))['version']) "
+        "if 'version.json' in os.listdir() else ''))",
         timeout=30,
     )
+    if result.returncode != 0:
+        return None
     match = re.search(r"V=(\S*)", result.stdout or "")
     if not match:
         return None
@@ -353,7 +437,7 @@ def local_firmware_version() -> str:
 
 
 def already_provisioned(port: str) -> bool:
-    listing = mpremote("connect", port, "fs", "ls", timeout=45).stdout or ""
+    listing = mp(port, "fs", "ls", timeout=45).stdout or ""
     if "main.py" not in listing or SECRETS.name not in listing:
         return False
     local = local_firmware_version()
@@ -409,7 +493,7 @@ def provision_once(args: argparse.Namespace) -> int:
 
     if not args.dry_run and not args.no_reboot:
         print("[boot] resetting the board")
-        mpremote("connect", target.port, "reset", timeout=30)
+        mp(target.port, "reset", timeout=30)
 
     print("\n[done] the Pico will join Wi-Fi, check GitHub for updates,")
     print("       then connect to the art server.")
