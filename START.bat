@@ -51,12 +51,12 @@ if not defined PYEXE (
     pause
     exit /b 1
 )
-echo   [1/4] Python  : %PYEXE% %PYARG%
+echo   [1/3] Python  : %PYEXE% %PYARG%
 
 REM ---- 2. dependencies ------------------------------------------------
 "%PYEXE%" %PYARG% -c "import numpy, serial, mpremote" >nul 2>&1
 if errorlevel 1 (
-    echo   [2/4] Installing dependencies, this happens once...
+    echo   [2/3] Installing dependencies, this happens once...
     "%PYEXE%" %PYARG% -m pip install -q --disable-pip-version-check -r pc_server\requirements.txt mpremote pyserial
     if errorlevel 1 (
         echo   [X] Dependency install failed. Check your internet connection.
@@ -64,25 +64,24 @@ if errorlevel 1 (
         exit /b 1
     )
 ) else (
-    echo   [2/4] Dependencies: ok
+    echo   [2/3] Dependencies: ok
 )
 
-REM ---- 3. background provisioner ---------------------------------------
-REM  Rescans USB every 30s. Flashes MicroPython + our firmware onto any
-REM  blank/BOOTSEL Pico automatically. Never touches foreign firmware.
-echo   [3/4] Starting the USB auto-provisioner
-start "Pico auto-provisioner" /min "%PYEXE%" %PYARG% tools\flash_pico.py --auto --watch 30
-
-REM ---- 4. the art server, with auto-restart ----------------------------
-echo   [4/4] Starting the art stream
-echo.
-echo   ------------------------------------------------------------------
+REM ---- 3. launch the desktop app ---------------------------------------
+REM  app\studio.py is a native Tkinter application. It runs the art server
+REM  in-process, exposes every setting, previews the live frame and can
+REM  build/flash/OTA the Pico - so there is nothing else to start and no
+REM  port or path for anyone to type in.
+echo   [3/3] Opening Pico DVI Art Studio
 echo.
 
 :RUN
-"%PYEXE%" %PYARG% pc_server\server.py
-echo.
-echo   [!] The server stopped. Restarting in 5 seconds...
-echo       (close this window to quit)
-timeout /t 5 /nobreak >nul
-goto RUN
+"%PYEXE%" %PYARG% app\studio.py
+if errorlevel 1 (
+    echo.
+    echo   [!] The app closed unexpectedly. Restarting in 5 seconds...
+    echo       ^(close this window to quit^)
+    timeout /t 5 /nobreak >nul
+    goto RUN
+)
+

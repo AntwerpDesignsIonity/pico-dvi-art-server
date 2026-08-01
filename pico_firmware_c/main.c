@@ -47,13 +47,26 @@
 #endif
 
 // ---------------------------------------------------------------- display
+// The panel is 1024x600 and scales whatever standard DVI mode we feed it. The
+// framebuffer is always half the mode in each axis because libdvi pixel-doubles
+// it (DVI_SYMBOLS_PER_WORD=2 horizontally, DVI_VERTICAL_REPEAT=2 vertically).
+// Must match pc_server/config.py DVI_MODES.
+#ifndef DVI_MODE_800X480
+#define DVI_MODE_800X480 0
+#endif
+
+#if DVI_MODE_800X480
+#define FRAME_WIDTH   400
+#define DVI_TIMING    dvi_timing_800x480p_60hz
+#else
 #define FRAME_WIDTH   320
+#define DVI_TIMING    dvi_timing_640x480p_60hz
+#endif
 #define FRAME_HEIGHT  240
 #define FRAME_PIXELS  (FRAME_WIDTH * FRAME_HEIGHT)
 #define FRAME_BYTES   (FRAME_PIXELS * 2)
 
 #define VREG_VSEL     VREG_VOLTAGE_1_20
-#define DVI_TIMING    dvi_timing_640x480p_60hz
 
 // One join attempt must fit inside the watchdog window, and the watchdog itself
 // is capped at roughly 8.3s by the hardware counter.
@@ -61,9 +74,15 @@
 #define JOIN_TIMEOUT_MS     20000
 #define WIFI_BACKOFF_MIN_MS 3000
 #define WIFI_BACKOFF_MAX_MS 60000
+#define JOIN_FAILURES_BEFORE_RESET 3
 
 struct dvi_inst dvi0;
 static bool dvi_running = false;
+
+// What the panel should say while it is not streaming. Updated by the network
+// code so a bystander can tell a Wi-Fi problem from a server problem from dead
+// hardware without ever plugging in a laptop.
+static char status_line[48] = "STARTING";
 
 // Two framebuffers: core0 scans one out while the network fills the other.
 static uint16_t framebuf[2][FRAME_PIXELS];
@@ -243,6 +262,7 @@ static bool wifi_join(uint32_t timeout_ms) {
         int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
         if (status != last_status) {
             printf("[wifi] link %s (%d)\n", link_name(status), status);
+            snprintf(status_line, sizeof(status_line), "WIFI %s", link_name(status));
             last_status = status;
         }
         if (status == CYW43_LINK_UP) {
@@ -390,6 +410,7 @@ static err_t on_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
         return err;
     }
     printf("[net] linked - streaming pixels\n");
+    snprintf(status_line, sizeof(status_line), "STREAMING");
     link_up = true;
     rx.state = RX_HEADER;
     rx.header_got = 0;
@@ -417,6 +438,7 @@ static bool connect_to_server(void) {
     tcp_recv(client_pcb, on_recv);
     tcp_err(client_pcb, on_err);
     printf("[net] connecting to %s:%d\n", SERVER_IP, SERVER_PORT);
+    snprintf(status_line, sizeof(status_line), "WIFI OK - CONNECTING TO SERVER");
     err_t err = tcp_connect(client_pcb, &server, SERVER_PORT, on_connected);
     cyw43_arch_lwip_end();
     return err == ERR_OK;
@@ -435,6 +457,72 @@ static void close_link(void) {
 }
 
 // ---------------------------------------------------------------- offline
+// 5x7 ASCII font, 0x20..0x5F (space through underscore). Five column bytes per
+// glyph, bit 0 = top row. Small enough to be worth carrying so the panel can
+// explain itself instead of showing an anonymous test pattern.
+static const uint8_t FONT5X7[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x5F,0x00,0x00}, // sp !
+    {0x00,0x07,0x00,0x07,0x00}, {0x14,0x7F,0x14,0x7F,0x14}, // " #
+    {0x24,0x2A,0x7F,0x2A,0x12}, {0x23,0x13,0x08,0x64,0x62}, // $ %
+    {0x36,0x49,0x55,0x22,0x50}, {0x00,0x05,0x03,0x00,0x00}, // & '
+    {0x00,0x1C,0x22,0x41,0x00}, {0x00,0x41,0x22,0x1C,0x00}, // ( )
+    {0x14,0x08,0x3E,0x08,0x14}, {0x08,0x08,0x3E,0x08,0x08}, // * +
+    {0x00,0x50,0x30,0x00,0x00}, {0x08,0x08,0x08,0x08,0x08}, // , -
+    {0x00,0x60,0x60,0x00,0x00}, {0x20,0x10,0x08,0x04,0x02}, // . /
+    {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, // 0 1
+    {0x42,0x61,0x51,0x49,0x46}, {0x21,0x41,0x45,0x4B,0x31}, // 2 3
+    {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39}, // 4 5
+    {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, // 6 7
+    {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1E}, // 8 9
+    {0x00,0x36,0x36,0x00,0x00}, {0x00,0x56,0x36,0x00,0x00}, // : ;
+    {0x08,0x14,0x22,0x41,0x00}, {0x14,0x14,0x14,0x14,0x14}, // < =
+    {0x00,0x41,0x22,0x14,0x08}, {0x02,0x01,0x51,0x09,0x06}, // > ?
+    {0x32,0x49,0x79,0x41,0x3E}, {0x7E,0x11,0x11,0x11,0x7E}, // @ A
+    {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22}, // B C
+    {0x7F,0x41,0x41,0x22,0x1C}, {0x7F,0x49,0x49,0x49,0x41}, // D E
+    {0x7F,0x09,0x09,0x09,0x01}, {0x3E,0x41,0x49,0x49,0x7A}, // F G
+    {0x7F,0x08,0x08,0x08,0x7F}, {0x00,0x41,0x7F,0x41,0x00}, // H I
+    {0x20,0x40,0x41,0x3F,0x01}, {0x7F,0x08,0x14,0x22,0x41}, // J K
+    {0x7F,0x40,0x40,0x40,0x40}, {0x7F,0x02,0x0C,0x02,0x7F}, // L M
+    {0x7F,0x04,0x08,0x10,0x7F}, {0x3E,0x41,0x41,0x41,0x3E}, // N O
+    {0x7F,0x09,0x09,0x09,0x06}, {0x3E,0x41,0x51,0x21,0x5E}, // P Q
+    {0x7F,0x09,0x19,0x29,0x46}, {0x46,0x49,0x49,0x49,0x31}, // R S
+    {0x01,0x01,0x7F,0x01,0x01}, {0x3F,0x40,0x40,0x40,0x3F}, // T U
+    {0x1F,0x20,0x40,0x20,0x1F}, {0x3F,0x40,0x38,0x40,0x3F}, // V W
+    {0x63,0x14,0x08,0x14,0x63}, {0x07,0x08,0x70,0x08,0x07}, // X Y
+    {0x61,0x51,0x49,0x45,0x43}, {0x00,0x7F,0x41,0x41,0x00}, // Z [
+    {0x02,0x04,0x08,0x10,0x20}, {0x00,0x41,0x41,0x7F,0x00}, // \ ]
+    {0x04,0x02,0x01,0x02,0x04}, {0x40,0x40,0x40,0x40,0x40}, // ^ _
+};
+
+static void draw_char(uint16_t *buf, int x, int y, char c, int scale, uint16_t rgb) {
+    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+    if (c < 0x20 || c > 0x5F) c = '?';
+    const uint8_t *glyph = FONT5X7[c - 0x20];
+    for (int col = 0; col < 5; ++col) {
+        for (int row = 0; row < 7; ++row) {
+            if (!(glyph[col] & (1u << row))) continue;
+            for (int dy = 0; dy < scale; ++dy) {
+                for (int dx = 0; dx < scale; ++dx) {
+                    int px = x + col * scale + dx;
+                    int py = y + row * scale + dy;
+                    if (px >= 0 && px < FRAME_WIDTH && py >= 0 && py < FRAME_HEIGHT) {
+                        buf[py * FRAME_WIDTH + px] = rgb;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void draw_text(uint16_t *buf, int x, int y, const char *s, int scale,
+                      uint16_t rgb) {
+    for (; *s; ++s) {
+        draw_char(buf, x, y, *s, scale, rgb);
+        x += 6 * scale;
+    }
+}
+
 // Something has to be on the glass when the server is unreachable, otherwise a
 // dark panel is indistinguishable from dead hardware.
 static void draw_standby(uint16_t *buf, uint frame) {
@@ -447,6 +535,26 @@ static void draw_standby(uint16_t *buf, uint frame) {
             buf[y * FRAME_WIDTH + x] = (uint16_t)((r << 11) | (g << 5) | b);
         }
     }
+
+    const uint16_t white = 0xFFFF;
+    const uint16_t amber = 0xFD20;
+    char line[48];
+
+    // Dark plate behind the text so it stays readable over the animation.
+    for (uint y = 60; y < 160 && y < FRAME_HEIGHT; ++y) {
+        for (uint x = 20; x < FRAME_WIDTH - 20; ++x) {
+            buf[y * FRAME_WIDTH + x] = 0x0000;
+        }
+    }
+
+    draw_text(buf, 30, 70,  "PICO DVI ART", 2, white);
+    draw_text(buf, 30, 96,  status_line, 1, amber);
+    snprintf(line, sizeof(line), "IP %s", ip_string());
+    draw_text(buf, 30, 112, line, 1, white);
+    snprintf(line, sizeof(line), "SERVER %s:%d", SERVER_IP, SERVER_PORT);
+    draw_text(buf, 30, 128, line, 1, white);
+    snprintf(line, sizeof(line), "SSID %s", WIFI_SSID);
+    draw_text(buf, 30, 144, line, 1, white);
 }
 
 // ---------------------------------------------------------------- cores
@@ -491,8 +599,10 @@ int main(void) {
     adc_set_temp_sensor_enabled(true);
 
     printf("\n[boot] pico-dvi-art client v%d (%s)\n", FIRMWARE_VERSION, DEVICE_ID);
-    printf("[boot] %dx%d RGB565 in 640x480p60 DVI, sys clock %lu kHz\n",
-           FRAME_WIDTH, FRAME_HEIGHT, (unsigned long)(clock_get_hz(clk_sys) / 1000));
+    printf("[boot] %dx%d RGB565 in %s DVI, sys clock %lu kHz\n",
+           FRAME_WIDTH, FRAME_HEIGHT,
+           DVI_MODE_800X480 ? "800x480p60" : "640x480p60",
+           (unsigned long)(clock_get_hz(clk_sys) / 1000));
 
     printf("[boot] ssid len %u fp %08lx / pass len %u fp %08lx\n",
            (unsigned)strlen(WIFI_SSID), (unsigned long)str_fingerprint(WIFI_SSID),
@@ -530,6 +640,7 @@ int main(void) {
     absolute_time_t next_retry = get_absolute_time();
     uint32_t wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
     bool scanned_once = false;
+    uint32_t join_failures = 0;
     absolute_time_t next_stat  = make_timeout_time_ms(5000);
     uint standby_frame = 0;
     uint32_t shown = 0;
@@ -557,6 +668,7 @@ int main(void) {
             bool associated = (status == CYW43_LINK_UP) || wifi_join(JOIN_TIMEOUT_MS);
             if (associated) {
                 wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
+                join_failures = 0;
                 connect_to_server();
                 next_retry = make_timeout_time_ms(3000);
             } else {
@@ -572,8 +684,31 @@ int main(void) {
                     scanned_once = true;
                     wifi_scan();
                 }
+                // An AP that has decided to refuse us often keeps refusing
+                // until the client's association state is genuinely gone. A
+                // full radio power-cycle is the only thing on this side that
+                // clears it, so escalate to that rather than retrying forever.
+                if (++join_failures >= JOIN_FAILURES_BEFORE_RESET) {
+                    join_failures = 0;
+                    printf("[wifi] resetting the radio after repeated refusals\n");
+                    watchdog_update();
+                    cyw43_arch_deinit();
+                    sleep_ms(500);
+                    watchdog_update();
+                    if (cyw43_arch_init() == 0) {
+                        cyw43_arch_enable_sta_mode();
+                        printf("[wifi] radio back up\n");
+                    } else {
+                        printf("[wifi] radio did not come back - rebooting\n");
+                        watchdog_reboot(0, 0, 0);
+                    }
+                    watchdog_update();
+                }
                 printf("[net] wifi retry in %lu ms\n",
                        (unsigned long)wifi_backoff_ms);
+                snprintf(status_line, sizeof(status_line),
+                         "WIFI REFUSED BY AP - RETRY IN %lus",
+                         (unsigned long)(wifi_backoff_ms / 1000));
                 next_retry = make_timeout_time_ms(wifi_backoff_ms);
                 wifi_backoff_ms *= 2;
                 if (wifi_backoff_ms > WIFI_BACKOFF_MAX_MS) {

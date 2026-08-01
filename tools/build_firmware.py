@@ -201,7 +201,7 @@ def shell_through_vcvars(vcvars: str, command: list[str], cwd: Path) -> int:
     return subprocess.call(line, shell=True, cwd=cwd)
 
 
-def build(clean: bool = False) -> Path:
+def build(clean: bool = False, mode: str = "640x480") -> Path:
     ensure_sources()
     write_wifi_config()
 
@@ -244,15 +244,26 @@ def build(clean: bool = False) -> Path:
     elif os.name == "nt":
         log("WARNING: no host compiler found - pioasm/picotool may fail to build")
 
+    wide = "ON" if mode == "800x480" else "OFF"
+    # The panel mode is baked into the binary, so a change has to re-run the
+    # configure step rather than reuse the cached one.
+    stamp = BUILD_DIR / "dvi_mode.stamp"
+    if stamp.exists() and stamp.read_text(encoding="utf-8").strip() != mode:
+        log(f"panel mode changed to {mode} - reconfiguring")
+        (BUILD_DIR / "build.ninja").unlink(missing_ok=True)
+
     if not (BUILD_DIR / "build.ninja").exists():
-        log("configuring")
+        log(f"configuring for {mode}")
         configure = [cmake, "-S", str(FIRMWARE_DIR), "-B", str(BUILD_DIR), "-G", "Ninja",
                      f"-DCMAKE_MAKE_PROGRAM={ninja}", "-DCMAKE_BUILD_TYPE=Release",
-                     f"-DPICODVI_PATH={PICODVI_DIR.as_posix()}"]
+                     f"-DPICODVI_PATH={PICODVI_DIR.as_posix()}",
+                     f"-DDVI_MODE_800X480={wide}"]
         rc = (shell_through_vcvars(vcvars, configure, FIRMWARE_DIR) if vcvars
               else subprocess.call(configure, cwd=FIRMWARE_DIR))
         if rc != 0:
             raise SystemExit("cmake configure failed")
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(mode, encoding="utf-8")
 
     log("compiling")
     compile_cmd = [cmake, "--build", str(BUILD_DIR)]
@@ -306,9 +317,11 @@ def main(argv=None) -> int:
     parser.add_argument("--clean", action="store_true", help="discard the build directory first")
     parser.add_argument("--flash", action="store_true", help="write the result to a connected board")
     parser.add_argument("--no-build", action="store_true", help="flash the existing .uf2 without rebuilding")
+    parser.add_argument("--mode", default="640x480", choices=["640x480", "800x480"],
+                        help="panel mode: 640x480 (320x240 buffer) or 800x480 (400x240)")
     args = parser.parse_args(argv)
 
-    uf2 = BUILD_DIR / UF2_NAME if args.no_build else build(clean=args.clean)
+    uf2 = BUILD_DIR / UF2_NAME if args.no_build else build(clean=args.clean, mode=args.mode)
     if args.no_build and not uf2.exists():
         raise SystemExit(f"{uf2} does not exist yet - run without --no-build first")
     if args.flash:

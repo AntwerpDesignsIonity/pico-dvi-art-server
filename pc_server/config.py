@@ -18,6 +18,13 @@ from pathlib import Path
 CONFIG_PATH = Path(__file__).with_name("config.json")
 
 
+DVI_MODES = {
+    # dvi_mode: (framebuffer width, framebuffer height)
+    "640x480": (320, 240),
+    "800x480": (400, 240),
+}
+
+
 @dataclass
 class Config:
     # --- network ---
@@ -25,8 +32,14 @@ class Config:
     port: int = 5001
 
     # --- framebuffer ---
-    # 320x240 is what the PICO-DVI-LCD carrier shows: the RP2350 emits
-    # 640x480p60 over DVI and pixel-doubles this buffer into it.
+    # The PICO-DVI-LCD 10.1 is a 1024x600 panel that accepts standard DVI modes
+    # and scales them. The RP2350 emits `dvi_mode` and pixel-doubles a
+    # half-size framebuffer into it, so width/height are always mode/2.
+    #   640x480  -> 320x240 buffer, 252.0 MHz bit clock (safest)
+    #   800x480  -> 400x240 buffer, 295.2 MHz bit clock (wider, fills more glass)
+    # Raising the DVI refresh does NOT raise art fps: the Wi-Fi link is the
+    # bottleneck, and the panel already re-scans the buffer 60 times a second.
+    dvi_mode: str = "640x480"
     width: int = 320
     height: int = 240
     byte_order: str = "little"  # "little" or "big" - must match the driver
@@ -104,6 +117,12 @@ class Config:
     def validate(self) -> None:
         if self.byte_order not in ("little", "big"):
             raise ValueError("byte_order must be 'little' or 'big'")
+        if self.dvi_mode not in DVI_MODES:
+            raise ValueError(f"dvi_mode must be one of {sorted(DVI_MODES)}")
+        # The framebuffer is always half the DVI mode in each axis, because the
+        # firmware pixel-doubles it. Deriving it here means the PC and the Pico
+        # can never disagree about the frame size.
+        self.width, self.height = DVI_MODES[self.dvi_mode]
         if self.source not in ("shader", "ai", "hybrid"):
             raise ValueError("source must be shader, ai or hybrid")
         if self.temp_source not in ("weather", "cpu", "static", "none"):

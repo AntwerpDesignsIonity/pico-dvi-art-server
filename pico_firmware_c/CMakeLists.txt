@@ -38,11 +38,17 @@ target_include_directories(pico_dvi_art_client PRIVATE
 # builds that skip the overclock must drop back to 2 or the chip will not start.
 set(CYW43_PIO_CLOCK_DIV 4 CACHE STRING "cyw43 PIO SPI clock divider")
 
+# Panel mode. OFF = 640x480p60 with a 320x240 buffer (252 MHz, safest).
+# ON  = 800x480p60 with a 400x240 buffer (295.2 MHz, fills more of the 10.1"
+# glass). Must match pc_server/config.py dvi_mode.
+option(DVI_MODE_800X480 "Use 800x480p60 / 400x240 instead of 640x480p60 / 320x240" OFF)
+
 target_compile_definitions(pico_dvi_art_client PRIVATE
     DVI_DEFAULT_SERIAL_CONFIG=${DVI_DEFAULT_SERIAL_CONFIG}
     DVI_VERTICAL_REPEAT=2
     DVI_N_TMDS_BUFFERS=3
     DVI_MONOCHROME_TMDS=0
+    DVI_MODE_800X480=$<BOOL:${DVI_MODE_800X480}>
     CYW43_HOST_NAME="pico-dvi-art"
     CYW43_PIO_CLOCK_DIV_INT=${CYW43_PIO_CLOCK_DIV}
     # Give a USB console a few seconds to attach so the boot log - which
