@@ -10,6 +10,9 @@ pc_server/ota.trigger
 pc_server/art_cache/
 preview/
 
+# Device credentials - MUST NEVER BE COMMITTED (the repo is public for raw OTA)
+pico_firmware/device_secrets.py
+
 # Pico OTA leftovers (only ever exist on the device, never in the repo)
 *.bak
 *.new

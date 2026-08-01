@@ -134,14 +134,17 @@ class OtaTests(unittest.TestCase):
 
     def test_config_is_never_overwritten(self):
         Path("config.py").write_text("WIFI_SSID = 'mine'\n")
+        Path("device_secrets.py").write_text("WIFI_PASS = 'mine'\n")
         self.publish(2)
         self.github.files["config.py"] = "WIFI_SSID = 'stolen'\n"
+        self.github.files["device_secrets.py"] = "WIFI_PASS = 'stolen'\n"
         data = json.loads(self.github.files["version.json"])
-        data["files"].append("config.py")
+        data["files"] += ["config.py", "device_secrets.py"]
         self.github.files["version.json"] = json.dumps(data)
         with self.assertRaises(ResetCalled):
             self.ota.check_and_update()
         self.assertEqual(Path("config.py").read_text(), "WIFI_SSID = 'mine'\n")
+        self.assertEqual(Path("device_secrets.py").read_text(), "WIFI_PASS = 'mine'\n")
 
     def test_failed_download_leaves_firmware_untouched(self):
         self.publish(2)

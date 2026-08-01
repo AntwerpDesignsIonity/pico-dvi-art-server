@@ -159,7 +159,8 @@ def check_and_update(verbose=True):
     staged = []
     try:
         for name in files:
-            if name == "config.py":  # never overwrite device credentials
+            # Never overwrite device-local credentials or settings.
+            if name in ("config.py", "device_secrets.py"):
                 continue
             response = _get(config.RAW_BASE + name)
             text = response.text

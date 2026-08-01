@@ -55,6 +55,40 @@ STAT fps=<f> drops=<n>
 
 ---
 
+## Cycle times — what changes, and how fast
+
+Nothing in the visual layer ever repeats: every animated term uses a mutually
+irrational frequency (φ, √2, √3, √5, √7), so the combined signal has **no finite
+period**. The numbers below are the *perceived* rhythms, not loop lengths.
+
+| Layer | Cycle | Where to change it |
+| --- | --- | --- |
+| Frame refresh | **20 fps** (50 ms) | `fps` / `--fps` (server renders up to ~41 fps) |
+| Vortex swirl rotation | ~18 s per turn | `t * 0.35` in `math_shaders.render` |
+| Full hue wheel (whole artwork) | **~28 s** | `t * 0.021 * PHI` |
+| Plasma band motion | 7–12 s | `f1`…`f4` frequencies |
+| Swirl strength breathing | ~57 s | `_drift(t, 0, 0.11)` |
+| Zoom breathing | ~90 s | `_drift(t, 1, 0.07)` |
+| Border hue wheel | ~8.3 s | `t * 0.12` in `SwirlBorder.apply` |
+| Border comet lap | ~4.5 s / ~7.7 s (counter-rotating) | `t * 0.22`, `t * 0.13` |
+| Clock digits | 1 s | `show_seconds` |
+| MCU temperature uplink | **5 s** | `TELEMETRY_INTERVAL_S` |
+| Server temperature refresh | **10 min** | `temp_refresh_s` |
+| New AI image (when enabled) | **90 s**, 3 s cross-fade | `ai_interval_s`, `ai_fade_s` |
+| OTA check | **on boot + hourly** | `OTA_ON_BOOT`, `OTA_CHECK_MINUTES` |
+| OTA on demand | ~2 s | `python pc_server/push_ota.py` |
+| Reconnect after server loss | 3 s, infinite retry | `RECONNECT_DELAY_S` |
+
+Because the drift terms are incommensurable, the *combination* of swirl angle, zoom,
+hue and plasma phase only approximately recurs on a timescale of years — and the
+random per-boot seed shifts all of them anyway, so restarting the server gives you a
+genuinely different piece.
+
+Want it calmer or wilder? `--speed 0.4` slows every visual cycle by 2.5x,
+`--speed 2.0` doubles them; the clock and temperatures are unaffected.
+
+---
+
 ## Repository layout
 
 ```
@@ -67,7 +101,8 @@ pico-dvi-art-server/
 │   ├── ota.py               # GitHub updater with staging + rollback
 │   ├── main.py              # stream receiver, telemetry, offline fallback
 │   ├── display_driver.py    # panel backends + offline animation
-│   ├── config.py            # Wi-Fi / server / GitHub settings (never OTA'd)
+│   ├── config.py            # tuning values (safe to publish)
+│   ├── device_secrets.example.py  # template -> copy to device_secrets.py
 │   └── version.json         # firmware version + file manifest
 ├── pc_server/               # runs on your PC / home server
 │   ├── server.py            # TCP server + stream orchestrator
@@ -129,10 +164,19 @@ frame it received to PNG - what you see there is exactly what the panel shows.
 
 ## 2. Flash the Pico W (once, over USB)
 
-1. Install MicroPython for the Pico W, then edit `pico_firmware/config.py`:
-   `WIFI_SSID`, `WIFI_PASS`, `SERVER_IP`, and the `GITHUB_*` values.
-2. Copy `boot.py`, `main.py`, `ota.py`, `display_driver.py`, `config.py` and
-   `version.json` to the board (Thonny, or `mpremote cp pico_firmware/* :`).
+1. Install MicroPython for the Pico W, then create your credentials file:
+
+   ```powershell
+   copy pico_firmware\device_secrets.example.py pico_firmware\device_secrets.py
+   ```
+
+   Edit it with your `WIFI_SSID`, `WIFI_PASS`, `SERVER_IP` and `GITHUB_*` values.
+   **It is git-ignored** — this repo has to be public for raw OTA to work, so the
+   password must never be committed. `config.py` reads it and falls back to harmless
+   placeholders when it is absent.
+2. Copy `boot.py`, `main.py`, `ota.py`, `display_driver.py`, `config.py`,
+   `device_secrets.py` and `version.json` to the board (Thonny, or
+   `mpremote cp pico_firmware/*.py :` — skip the `.example` file).
 3. Power the board from any USB adapter next to the panel.
 
 On boot it joins Wi-Fi, checks GitHub for a newer firmware version, then connects to
@@ -154,8 +198,10 @@ If red and blue look swapped, flip the byte order on the server:
 
 ## 3. OTA updates over GitHub
 
-1. Push this repo to GitHub (public, or the raw URLs will 404).
-2. Set `GITHUB_USER` / `GITHUB_REPO` / `GITHUB_BRANCH` in `pico_firmware/config.py`.
+1. Push this repo to GitHub (public, or the raw URLs will 404 — which is exactly why
+   `device_secrets.py` is git-ignored).
+2. Set `GITHUB_USER` / `GITHUB_REPO` / `GITHUB_BRANCH` in
+   `pico_firmware/device_secrets.py`.
 3. Edit any firmware file and push. `release.yml` bumps `version.json` and rewrites its
    file manifest automatically.
 4. The board updates on its next boot, on its scheduled check
@@ -176,8 +222,8 @@ and an `ota.pending` marker is written. `main.py` calls `ota.mark_boot_ok()` aft
 that far, the next boot restores the backups, marks the bad version as `blocked` and
 refuses to install it again - push a higher version to recover.
 
-`config.py` is deliberately excluded from the manifest, so OTA never overwrites your
-Wi-Fi credentials.
+`config.py` and `device_secrets.py` are deliberately excluded from the manifest, so
+OTA never overwrites your Wi-Fi credentials.
 
 ---
 
