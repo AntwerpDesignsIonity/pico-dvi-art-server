@@ -19,6 +19,53 @@ GitHub OTA firmware updates.
 
 ---
 
+## Run it — one file, no questions
+
+Double-click **`START.bat`**. That is the whole procedure.
+
+It finds Python (installing nothing you already have), installs the dependencies the
+first time, launches a background USB watcher, and starts streaming. There are no
+menus, no port numbers to type and no options to pick. Close the window to stop it.
+
+```
+START.bat
+  ├── finds Python 3.9+ (PATH, py launcher, or %LOCALAPPDATA%\Programs\Python)
+  ├── pip install -r pc_server/requirements.txt mpremote pyserial   (first run only)
+  ├── tools/flash_pico.py --auto --watch 30   ← background, provisions any Pico
+  └── pc_server/server.py                     ← streams art, auto-restarts on crash
+```
+
+The watcher rescans USB every 30 seconds, so you can plug the Pico in at any time —
+before or after starting — and it gets set up on its own.
+
+### What the auto-provisioner does to a board
+
+| Board state                        | Action                                                    |
+| ---------------------------------- | --------------------------------------------------------- |
+| BOOTSEL (`RPI-RP2` drive)          | downloads the latest MicroPython `.uf2`, installs it, then copies the firmware |
+| MicroPython, wrong/no firmware     | copies the firmware and resets the board                   |
+| MicroPython, firmware already current | left alone                                              |
+| **Any other firmware**             | **never touched** — flashing would erase it permanently    |
+
+That last row is deliberate. If your display board is currently running its own
+firmware, put it in BOOTSEL mode first: unplug it, hold the **BOOTSEL** button, plug it
+back in, release. An `RPI-RP2` drive appears and the installer takes over by itself.
+
+Wi-Fi credentials and the server address live in `pico_firmware/device_secrets.py`,
+which is git-ignored and never uploaded. The provisioner creates it on the first run
+(from the `PICO_WIFI_SSID` / `PICO_WIFI_PASS` environment variables when running
+unattended) and keeps `SERVER_IP` pointing at this PC's current LAN address.
+
+Advanced use, if you ever want it:
+
+```
+python tools/flash_pico.py --list      # identify every connected board, change nothing
+python tools/flash_pico.py             # interactive setup, prompts for credentials
+python tools/flash_pico.py --dry-run   # show the plan
+```
+
+---
+
 ## Architecture
 
 ```
@@ -93,6 +140,7 @@ Want it calmer or wilder? `--speed 0.4` slows every visual cycle by 2.5x,
 
 ```
 pico-dvi-art-server/
+├── START.bat                # ← the only file you run. Everything else is internal.
 ├── .github/workflows/
 │   ├── release.yml          # auto-increments pico_firmware/version.json on push
 │   └── ci.yml               # tests + firmware byte-compile
@@ -117,6 +165,8 @@ pico-dvi-art-server/
 │   ├── push_ota.py          # tell every connected board to update now
 │   ├── config.example.json  # copy to config.json and edit
 │   └── requirements.txt
+├── tools/
+│   └── flash_pico.py        # USB detection + MicroPython install + provisioning
 └── tests/
     ├── test_pipeline.py      # font, packing, shaders, HUD, socket round-trip
     └── test_ota.py           # OTA staging / rollback against a stubbed GitHub
@@ -125,6 +175,8 @@ pico-dvi-art-server/
 ---
 
 ## 1. Run the server
+
+`START.bat` already does all of this. The commands below are the manual equivalent.
 
 ```powershell
 pip install -r pc_server/requirements.txt
@@ -162,7 +214,10 @@ frame it received to PNG - what you see there is exactly what the panel shows.
 
 ---
 
-## 2. Flash the Pico W (once, over USB)
+## 2. Flash the Pico W (automatic)
+
+`START.bat` does this for you — see [Run it](#run-it--one-file-no-questions) above.
+The manual route below is only for when you want to do it by hand.
 
 1. Install MicroPython for the Pico W, then create your credentials file:
 

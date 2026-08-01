@@ -9,6 +9,10 @@ pc_server/config.json
 pc_server/ota.trigger
 pc_server/art_cache/
 preview/
+received.png
+
+# Downloaded MicroPython .uf2 images (tools/flash_pico.py)
+.cache/
 
 # Device credentials - MUST NEVER BE COMMITTED (the repo is public for raw OTA)
 pico_firmware/device_secrets.py
