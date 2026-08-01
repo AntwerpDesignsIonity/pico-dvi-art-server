@@ -1,21 +1,21 @@
 @echo off
 setlocal EnableDelayedExpansion
-title Pico DVI Art Server - Antwerp Ionity
+title Pico DVI Art Studio - Antwerp Ionity
 cd /d "%~dp0"
 
 REM ===================================================================
 REM  START.bat - the ONLY file you run. No questions, no options.
 REM
 REM  It finds Python, installs what it needs, provisions any Pico that
-REM  is (or later gets) plugged in, and streams art forever. If the
-REM  server ever dies it restarts itself.
+REM  is (or later gets) plugged in, and opens preview/device controls.
+REM  Art renders on the Pico and continues when this app is closed.
 REM
 REM  Stop it by closing the window.
 REM ===================================================================
 
 echo.
 echo   ==================================================================
-echo      PICO DVI ART SERVER - starting up
+echo      PICO DVI ART STUDIO - starting up
 echo   ==================================================================
 echo.
 
@@ -68,8 +68,8 @@ if errorlevel 1 (
 )
 
 REM ---- 3. launch the desktop app ---------------------------------------
-REM  app\studio.py is a native Tkinter application. It runs the art server
-REM  in-process, exposes every setting, previews the live frame and can
+REM  app\studio.py is a native Tkinter application. It runs the control server
+REM  in-process, exposes preview settings, shows a desktop preview and can
 REM  build/flash/OTA the Pico - so there is nothing else to start and no
 REM  port or path for anyone to type in.
 echo   [3/3] Opening Pico DVI Art Studio
@@ -84,4 +84,3 @@ if errorlevel 1 (
     timeout /t 5 /nobreak >nul
     goto RUN
 )
-

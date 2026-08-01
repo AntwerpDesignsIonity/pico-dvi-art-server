@@ -1,18 +1,18 @@
-"""TCP frame server: infinite generative art + HUD, streamed as RGB565.
+"""Pico DVI preview and control server.
 
-    python pc_server/server.py            # stream on 0.0.0.0:5001
+    python pc_server/server.py            # preview/control on 0.0.0.0:5001
     python pc_server/server.py --fps 25 --source hybrid
     python pc_server/server.py --self-test # render locally, no hardware needed
 
 Wire protocol (server -> Pico), little-endian:
 
-    frame  : b'\\xAA\\xBB\\xCC\\xDD' | uint32 length | length bytes RGB565
+    frame  : b'\\xAA\\xBB\\xCC\\xDD' | uint32 length | length bytes RGB565 (legacy)
     command: b'\\xAA\\xBB\\xCC\\xEE' | uint32 length | length bytes UTF-8 JSON
 
 Uplink (Pico -> server) is newline-terminated ASCII:
 
-    HELLO <fw_version> <device_id>
-    TEMP <celsius>          # RP2040 on-chip sensor -> shown as "MCU" on the HUD
+    HELLO <fw_version> <device_id> [LOCAL]
+    TEMP <celsius>          # RP2350 on-chip sensor -> shown as "MCU" in preview
     STAT fps=<f> drops=<n>
     PONG
 """
@@ -55,9 +55,12 @@ class ClientSession:
     device_id: str = ""
     client_fps: float | None = None
     last_seen: float = field(default_factory=time.time)
+    render_mode: str = "legacy"
+    hello_received: threading.Event = field(default_factory=threading.Event)
+    disconnected: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
-    # Frames and OTA commands are written from different threads; without this
-    # a command could be spliced into the middle of a frame payload.
+    # Legacy frames and commands are written from different threads; without
+    # this a command could be spliced into the middle of a frame payload.
     send_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def snapshot(self) -> tuple[float | None, str]:
@@ -162,9 +165,9 @@ class ArtServer:
         server.settimeout(1.0)
 
         print(
-            f"[*] pico-dvi-art-server on {cfg.host}:{cfg.port} | "
-            f"{cfg.width}x{cfg.height} RGB565 ({cfg.byte_order}-endian) | "
-            f"{cfg.frame_size} B/frame | source={cfg.source} | fps={cfg.fps:g}"
+            f"[*] pico-dvi preview/control server on {cfg.host}:{cfg.port} | "
+            f"preview={cfg.width}x{cfg.height} source={cfg.source} | "
+            "local-render devices receive commands only"
         )
         print(f"[*] local addresses: {', '.join(local_addresses())}")
         print(
@@ -205,6 +208,28 @@ class ArtServer:
             target=self._uplink_reader, args=(conn, session), daemon=True
         )
         reader.start()
+
+        # New RP2350 firmware advertises LOCAL and only needs this socket for
+        # commands and telemetry. Give HELLO a moment to arrive before deciding
+        # whether this is an older frame-streaming client.
+        session.hello_received.wait(timeout=2.0)
+        if session.render_mode == "local":
+            print(f"[=] {addr[0]} renders locally; pixel streaming disabled")
+            try:
+                while (
+                    not self._stop.is_set()
+                    and not session.disconnected.wait(timeout=1.0)
+                ):
+                    pass
+            finally:
+                with self._clients_lock:
+                    self._clients = [(s, c) for s, c in self._clients if c is not conn]
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            print(f"[-] local-render client disconnected: {addr[0]}")
+            return
 
         interval = 1.0 / self.cfg.fps
         sent = 0
@@ -278,6 +303,8 @@ class ArtServer:
                     buffer = b""
         except OSError:
             return
+        finally:
+            session.disconnected.set()
 
     @staticmethod
     def _handle_uplink(line: str, session: ClientSession) -> None:
@@ -295,6 +322,11 @@ class ArtServer:
             elif verb == "HELLO":
                 session.fw_version = parts[1] if len(parts) > 1 else "?"
                 session.device_id = parts[2] if len(parts) > 2 else ""
+                session.render_mode = (
+                    "local" if any(part.upper() == "LOCAL" for part in parts[3:])
+                    else "legacy"
+                )
+                session.hello_received.set()
                 print(f"[i] {session.address[0]} says hello: fw={session.fw_version} id={session.device_id}")
             elif verb == "STAT":
                 for token in parts[1:]:

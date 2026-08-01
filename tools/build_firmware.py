@@ -1,4 +1,4 @@
-"""Build (and optionally flash) the C/DVI firmware for the Pico 2 W.
+"""Build (and optionally flash) the local-render C/DVI firmware for Pico 2 W.
 
 The MicroPython firmware in pico_firmware/ cannot light this panel: the carrier
 wires DVI to GP8-GP15 and no MicroPython build ships a PIO DVI driver. The C
@@ -183,7 +183,7 @@ def write_wifi_config() -> Path:
         "#endif\n",
         encoding="utf-8",
     )
-    log(f"wifi_config.h -> server {secrets['SERVER_IP']}:{secrets['SERVER_PORT']}")
+    log(f"wifi_config.h -> control server {secrets['SERVER_IP']}:{secrets['SERVER_PORT']}")
     return header
 
 

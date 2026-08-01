@@ -35,12 +35,12 @@ class Config:
     # and scales them. The RP2350 emits `dvi_mode` and pixel-doubles a
     # half-size framebuffer into it, so width/height are always mode/2.
     #   640x480  -> 320x240 buffer, 252.0 MHz bit clock (safest)
-    # Raising the DVI refresh does NOT raise art fps: the Wi-Fi link is the
-    # bottleneck, and the panel already re-scans the buffer 60 times a second.
+    # The C firmware renders locally; these values drive the desktop preview
+    # and remain compatible with legacy frame-streaming firmware.
     dvi_mode: str = "640x480"
     width: int = 320
     height: int = 240
-    byte_order: str = "little"  # fixed by the Pico firmware wire protocol
+    byte_order: str = "little"  # legacy frame protocol and preview packing
     fps: float = 20.0
 
     # --- art ---

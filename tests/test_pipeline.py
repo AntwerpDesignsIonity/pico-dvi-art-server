@@ -323,5 +323,28 @@ class StreamingTests(unittest.TestCase):
         self.assertGreaterEqual(delivered, 0)
 
 
+class LocalRenderProtocolTests(unittest.TestCase):
+    def test_local_render_capability_disables_frame_streaming(self):
+        cfg = Config()
+        server = art_server.ArtServer(cfg)
+        server_side, pico_side = socket.socketpair()
+        thread = threading.Thread(
+            target=server._client_thread,
+            args=(server_side, ("local-pico", 5001)),
+            daemon=True,
+        )
+        thread.start()
+
+        pico_side.sendall(b"HELLO 8 pico-test LOCAL\n")
+        pico_side.settimeout(0.4)
+        with self.assertRaises(socket.timeout):
+            pico_side.recv(1)
+
+        server._stop.set()
+        pico_side.close()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
