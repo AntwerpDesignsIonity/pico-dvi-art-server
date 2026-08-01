@@ -168,3 +168,45 @@ def render_hud(rgb: np.ndarray, state: HudState, cfg) -> np.ndarray:
     )
     rgb[rule_y : rule_y + 2, rule_x0:right] = np.array(accent, dtype=np.uint8)
     return rgb
+
+
+def render_centered_hud(rgb: np.ndarray, state: HudState, cfg) -> np.ndarray:
+    """Draw an unframed 8-bit readout in the center of the scene."""
+    now = state.now or local_now(getattr(cfg, "timezone", ""))
+    if getattr(cfg, "clock_24h", True):
+        clock_fmt = "%H:%M:%S" if getattr(cfg, "show_seconds", True) else "%H:%M"
+        clock_text = now.strftime(clock_fmt)
+    else:
+        clock_fmt = "%I:%M:%S %p" if getattr(cfg, "show_seconds", True) else "%I:%M %p"
+        clock_text = now.strftime(clock_fmt).upper().lstrip("0")
+
+    lines = [
+        (clock_text, int(getattr(cfg, "hud_scale_clock", 3)), (255, 255, 255)),
+        (
+            now.strftime(getattr(cfg, "date_format", "%Y-%m-%d %a")).upper(),
+            int(getattr(cfg, "hud_scale_small", 2)),
+            (110, 235, 255),
+        ),
+        (
+            f"{state.server_label} {format_temp(state.server_temp_c)}",
+            int(getattr(cfg, "hud_scale_small", 2)),
+            (110, 255, 170),
+        ),
+        (
+            f"{state.local_label} {format_temp(state.local_temp_c)}",
+            int(getattr(cfg, "hud_scale_small", 2)),
+            (255, 180, 85),
+        ),
+    ]
+    heights = [text_size(text, scale, TRACKING)[1] for text, scale, _ in lines]
+    gaps = (6, 4, 3)
+    total_height = sum(heights) + sum(gaps)
+    center_x = rgb.shape[1] // 2
+    y = max(0, (rgb.shape[0] - total_height) // 2)
+    for index, (text, scale, color) in enumerate(lines):
+        draw_text_shadowed(
+            rgb, text, center_x, y, scale, color, align="center",
+            shadow=(3, 4, 12),
+        )
+        y += heights[index] + (gaps[index] if index < len(gaps) else 0)
+    return rgb

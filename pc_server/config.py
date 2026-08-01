@@ -42,11 +42,11 @@ class Config:
     dvi_mode: str = "640x480"
     width: int = 320
     height: int = 240
-    byte_order: str = "little"  # "little" or "big" - must match the driver
+    byte_order: str = "little"  # fixed by the Pico firmware wire protocol
     fps: float = 20.0
 
     # --- art ---
-    source: str = "shader"  # shader | ai | hybrid
+    source: str = "shader"  # shader | retro | ai | hybrid
     speed: float = 1.0
     seed: int | None = None
     border_thickness: int = 8
@@ -115,16 +115,16 @@ class Config:
             setattr(self, key, _coerce(getattr(self, key), value))
 
     def validate(self) -> None:
-        if self.byte_order not in ("little", "big"):
-            raise ValueError("byte_order must be 'little' or 'big'")
+        if self.byte_order != "little":
+            raise ValueError("byte_order must be 'little' for the Pico firmware")
         if self.dvi_mode not in DVI_MODES:
             raise ValueError(f"dvi_mode must be one of {sorted(DVI_MODES)}")
         # The framebuffer is always half the DVI mode in each axis, because the
         # firmware pixel-doubles it. Deriving it here means the PC and the Pico
         # can never disagree about the frame size.
         self.width, self.height = DVI_MODES[self.dvi_mode]
-        if self.source not in ("shader", "ai", "hybrid"):
-            raise ValueError("source must be shader, ai or hybrid")
+        if self.source not in ("shader", "retro", "ai", "hybrid"):
+            raise ValueError("source must be shader, retro, ai or hybrid")
         if self.temp_source not in ("weather", "cpu", "static", "none"):
             raise ValueError("temp_source must be weather, cpu, static or none")
         if self.width <= 0 or self.height <= 0:

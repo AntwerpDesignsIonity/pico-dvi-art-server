@@ -17,9 +17,11 @@ Nothing here asks the user to pick a port, an IP or a file path.
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 import queue
+import re
 import socket
 import subprocess
 import sys
@@ -29,6 +31,9 @@ import tkinter as tk
 from dataclasses import fields
 from pathlib import Path
 from tkinter import messagebox, ttk
+
+import serial
+from serial.tools import list_ports
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "pc_server"))
@@ -41,16 +46,18 @@ from server import ArtServer, local_addresses  # noqa: E402
 PYTHON = sys.executable
 POLL_MS = 120
 PREVIEW_ZOOM = 2
+RASPBERRY_PI_VID = 0x2E8A
+USB_STREAM_FPS = 5.0
+DEVICE_SECRETS = REPO / "pico_firmware" / "device_secrets.py"
 
 # (field name, label, widget kind, options)
 SETTING_GROUPS: list[tuple[str, list[tuple[str, str, str, object]]]] = [
     ("Display", [
         ("dvi_mode", "Panel mode", "choice", sorted(DVI_MODES)),
         ("fps", "Target frames/second", "float", None),
-        ("byte_order", "Byte order", "choice", ["little", "big"]),
     ]),
     ("Art", [
-        ("source", "Art source", "choice", ["shader", "ai", "hybrid"]),
+        ("source", "Art source", "choice", ["shader", "retro", "ai", "hybrid"]),
         ("speed", "Animation speed", "float", None),
         ("seed", "Seed (blank = random)", "text", None),
         ("border_thickness", "Border thickness (px)", "int", None),
@@ -86,6 +93,8 @@ SETTING_GROUPS: list[tuple[str, list[tuple[str, str, str, object]]]] = [
         ("ai_api_key_env", "API key env var", "text", None),
     ]),
     ("Network", [
+        ("wifi_ssid", "Wi-Fi SSID", "text", None),
+        ("wifi_pass", "Wi-Fi password", "password", None),
         ("host", "Listen address", "text", None),
         ("port", "Port", "int", None),
     ]),
@@ -117,6 +126,128 @@ class LogTee(io.TextIOBase):
                 pass
 
 
+class UsbFrameTransport:
+    """Stream frames over USB CDC when TCP is unavailable."""
+
+    def __init__(self, studio: "Studio") -> None:
+        self.studio = studio
+        self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.port: str | None = None
+        self.connected = False
+        self.streaming = False
+        self.frames_sent = 0
+        self.frames_acked = 0
+        self.error = ""
+        self._read_buffer = b""
+        self.thread = threading.Thread(
+            target=self._run, name="usb-frame-transport", daemon=True
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=3)
+
+    def pause(self) -> None:
+        self.pause_event.set()
+        deadline = time.monotonic() + 4
+        while self.connected and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    def resume(self) -> None:
+        self.pause_event.clear()
+
+    @staticmethod
+    def _pico_port() -> str | None:
+        return next(
+            (
+                info.device
+                for info in list_ports.comports()
+                if info.vid == RASPBERRY_PI_VID
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _tcp_connected(server: ArtServer) -> bool:
+        with server._clients_lock:
+            return bool(server._clients)
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            if self.pause_event.is_set():
+                self.connected = False
+                self.streaming = False
+                self.stop_event.wait(0.1)
+                continue
+            port = self._pico_port()
+            if port is None:
+                self.port = None
+                self.connected = False
+                self.streaming = False
+                self.stop_event.wait(1)
+                continue
+
+            self.port = port
+            try:
+                with serial.Serial(
+                    port, 115200, timeout=0, write_timeout=8
+                ) as device:
+                    self.connected = True
+                    self.error = ""
+                    self.studio.log(f"[usb] Pico connected on {port}")
+                    self._stream(device)
+            except (OSError, serial.SerialException) as exc:
+                self.error = str(exc)
+                self.studio.log(f"[usb] {port} disconnected: {exc}")
+            finally:
+                self.connected = False
+                self.streaming = False
+            self.stop_event.wait(1)
+
+    def _stream(self, device: serial.Serial) -> None:
+        interval = 1.0 / USB_STREAM_FPS
+        next_due = time.monotonic()
+        while not self.stop_event.is_set() and not self.pause_event.is_set():
+            self._read_status(device)
+            server = self.studio.server
+            if server is None or self._tcp_connected(server):
+                self.streaming = False
+                self.stop_event.wait(0.2)
+                next_due = time.monotonic()
+                continue
+
+            device.write(server.frame_bytes())
+            device.flush()
+            self.frames_sent += 1
+            self.streaming = True
+
+            next_due += interval
+            delay = next_due - time.monotonic()
+            if delay > 0:
+                self.stop_event.wait(delay)
+            else:
+                next_due = time.monotonic()
+
+    def _read_status(self, device: serial.Serial) -> None:
+        self._read_buffer += device.read_all()
+        while b"\n" in self._read_buffer:
+            raw, self._read_buffer = self._read_buffer.split(b"\n", 1)
+            line = raw.decode("utf-8", "replace").strip()
+            if line.startswith("USBFRAME "):
+                try:
+                    self.frames_acked = int(line.split()[1])
+                except (IndexError, ValueError):
+                    continue
+                if self.frames_acked == 1 or self.frames_acked % 25 == 0:
+                    self.studio.log(
+                        f"[usb] Pico confirmed {self.frames_acked} displayed frames"
+                    )
+
+
 class Studio(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -131,6 +262,7 @@ class Studio(tk.Tk):
         self.vars: dict[str, tk.Variable] = {}
         self._preview_img: tk.PhotoImage | None = None
         self._busy = False
+        self.usb = UsbFrameTransport(self)
 
         sys.stdout = LogTee(self.logq, sys.__stdout__)
         sys.stderr = LogTee(self.logq, sys.__stderr__)
@@ -141,6 +273,7 @@ class Studio(tk.Tk):
         self.after(POLL_MS, self._tick)
         self.log(f"Ready. Repo: {REPO}")
         self.start_server()
+        self.usb.start()
 
     # -- construction ----------------------------------------------------
     def _build_ui(self) -> None:
@@ -212,14 +345,18 @@ class Studio(tk.Tk):
                 ).grid(row=row, column=1, sticky="ew")
             else:
                 var = tk.StringVar()
-                ttk.Entry(page, textvariable=var).grid(row=row, column=1, sticky="ew")
+                entry = ttk.Entry(page, textvariable=var)
+                if kind == "password":
+                    entry.configure(show="*")
+                entry.grid(row=row, column=1, sticky="ew")
             self.vars[name] = var
         return page
 
     # -- settings --------------------------------------------------------
     def _load_into_widgets(self) -> None:
+        wifi = self._read_wifi_settings()
         for name, var in self.vars.items():
-            value = getattr(self.cfg, name, "")
+            value = wifi.get(name, getattr(self.cfg, name, ""))
             if isinstance(var, tk.BooleanVar):
                 var.set(bool(value))
             else:
@@ -229,11 +366,73 @@ class Studio(tk.Tk):
         known = {f.name for f in fields(Config)}
         return {n: v.get() for n, v in self.vars.items() if n in known}
 
+    @staticmethod
+    def _read_wifi_settings() -> dict[str, str]:
+        if not DEVICE_SECRETS.exists():
+            return {}
+        try:
+            tree = ast.parse(DEVICE_SECRETS.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            return {}
+        values: dict[str, str] = {}
+        wanted = {"WIFI_SSID": "wifi_ssid", "WIFI_PASS": "wifi_pass"}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name) or target.id not in wanted:
+                continue
+            try:
+                value = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, str):
+                values[wanted[target.id]] = value
+        return values
+
+    def _save_wifi_settings(self) -> None:
+        ssid = str(self.vars["wifi_ssid"].get()).strip()
+        password = str(self.vars["wifi_pass"].get())
+        if not ssid:
+            raise ValueError("Wi-Fi SSID cannot be blank")
+        if not DEVICE_SECRETS.exists():
+            server_ip = next(
+                (
+                    address for address in local_addresses()
+                    if address != "127.0.0.1" and not address.startswith("172.")
+                ),
+                "127.0.0.1",
+            )
+            text = (
+                "# Local device credentials - git-ignored, never uploaded.\n"
+                f"WIFI_SSID = {ssid!r}\n"
+                f"WIFI_PASS = {password!r}\n"
+                f"SERVER_IP = {server_ip!r}\n"
+                f"SERVER_PORT = {self.cfg.port}\n"
+                "DEVICE_ID = 'pico-dvi-01'\n"
+                "GITHUB_USER = 'AntwerpDesignsIonity'\n"
+                "GITHUB_REPO = 'pico-dvi-art-server'\n"
+                "GITHUB_BRANCH = 'main'\n"
+            )
+        else:
+            text = DEVICE_SECRETS.read_text(encoding="utf-8")
+            replacements = {"WIFI_SSID": ssid, "WIFI_PASS": password}
+            for key, value in replacements.items():
+                line = f"{key} = {value!r}"
+                pattern = rf"(?m)^{key}\s*=.*$"
+                text = (
+                    re.sub(pattern, line, text)
+                    if re.search(pattern, text)
+                    else text.rstrip() + "\n" + line + "\n"
+                )
+        DEVICE_SECRETS.write_text(text, encoding="utf-8")
+
     def save_settings(self) -> bool:
         candidate = Config.load()
         try:
             candidate.update(self._collect())
             candidate.validate()
+            self._save_wifi_settings()
         except (ValueError, TypeError) as exc:
             messagebox.showerror("Invalid setting", str(exc))
             return False
@@ -312,23 +511,54 @@ class Studio(tk.Tk):
             return
         args = [PYTHON, str(REPO / "tools" / "build_firmware.py"), "--flash",
                 "--mode", self.cfg.dvi_mode]
-        self._run_tool(args, "firmware build + flash")
+        self._run_tool(args, "firmware build + flash", release_usb=True)
 
     def push_ota(self) -> None:
-        srv = self.server
-        if srv is None:
-            messagebox.showinfo("Not running", "Start the server first.")
+        if self._busy:
             return
-        sent = srv.broadcast_command({"action": "ota"})
-        self.log(f"OTA requested on {sent} device(s).")
+        if not self.save_settings():
+            return
+        srv = self.server
+        clients = []
+        if srv is not None:
+            with srv._clients_lock:
+                clients = list(srv._clients)
+        if self.usb.connected or self.usb.port:
+            args = [
+                PYTHON, str(REPO / "tools" / "build_firmware.py"), "--flash",
+                "--mode", self.cfg.dvi_mode,
+            ]
+            self._run_tool(args, "OTA build + USB flash", release_usb=True)
+            return
+        if not clients:
+            messagebox.showinfo(
+                "No Pico connected",
+                "Connect the Pico by USB or wait for its Wi-Fi connection.",
+            )
+            return
+        args = [
+            PYTHON, str(REPO / "tools" / "build_firmware.py"),
+            "--mode", self.cfg.dvi_mode,
+        ]
+        self._run_tool(args, "OTA build", network_ota=True)
 
-    def _run_tool(self, args: list[str], what: str) -> None:
+    def _run_tool(
+        self,
+        args: list[str],
+        what: str,
+        *,
+        release_usb: bool = False,
+        network_ota: bool = False,
+    ) -> None:
         self._busy = True
         self.btn_build.configure(state="disabled")
+        self.btn_ota.configure(state="disabled")
         self.log(f"--- {what} ---")
 
         def worker() -> None:
             try:
+                if release_usb:
+                    self.usb.pause()
                 proc = subprocess.Popen(
                     args, cwd=str(REPO), stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -336,12 +566,38 @@ class Studio(tk.Tk):
                 for line in proc.stdout:
                     self.logq.put(line)
                 code = proc.wait()
+                if code == 0 and network_ota:
+                    srv = self.server
+                    sent = (
+                        srv.broadcast_command({"action": "ota"})
+                        if srv is not None else 0
+                    )
+                    self.logq.put(f"[ota] reboot command sent to {sent} device(s)\n")
+                    if sent:
+                        flash_args = [
+                            PYTHON,
+                            str(REPO / "tools" / "build_firmware.py"),
+                            "--no-build",
+                            "--flash",
+                            "--mode",
+                            self.cfg.dvi_mode,
+                        ]
+                        proc = subprocess.Popen(
+                            flash_args, cwd=str(REPO), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                        )
+                        for line in proc.stdout:
+                            self.logq.put(line)
+                        code = proc.wait()
                 self.logq.put(f"--- {what} finished (exit {code}) ---\n")
             except OSError as exc:
                 self.logq.put(f"[!] {what} failed: {exc}\n")
             finally:
+                if release_usb:
+                    self.usb.resume()
                 self._busy = False
                 self.btn_build.configure(state="normal")
+                self.btn_ota.configure(state="normal")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -399,10 +655,17 @@ class Studio(tk.Tk):
         )
 
         if not clients:
+            if self.usb.connected:
+                mode = "streaming real frames" if self.usb.streaming else "connected"
+                self.device_label.configure(
+                    text=f"Pico connected by USB on {self.usb.port}.\n"
+                         f"USB fallback: {mode} at up to {USB_STREAM_FPS:g} fps.\n"
+                         f"Frames sent: {self.usb.frames_sent}   "
+                         f"shown by Pico: {self.usb.frames_acked}"
+                )
+                return
             self.device_label.configure(
-                text="No device connected.\n"
-                     "The Pico shows a diagonal standby pattern until it joins\n"
-                     "Wi-Fi and reaches this server."
+                text="No Raspberry Pi Pico detected by TCP or USB."
             )
             return
 
@@ -423,9 +686,10 @@ class Studio(tk.Tk):
 
     # -- misc ------------------------------------------------------------
     def log(self, message: str) -> None:
-        self.logq.put(message.rstrip() + "\n")
+        print(message.rstrip(), flush=True)
 
     def _on_close(self) -> None:
+        self.usb.stop()
         self.stop_server()
         sys.stdout = sys.__stdout__
         sys.stderr = sys.__stderr__

@@ -1,5 +1,6 @@
 # Core streaming engine
 numpy>=1.24
+pyserial>=3.5
 
 # Optional extras:
 #   pillow  -> AI image mode (decode/resize generated art)

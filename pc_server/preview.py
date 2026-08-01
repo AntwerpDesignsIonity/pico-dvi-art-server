@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import math_shaders  # noqa: E402
 from config import Config  # noqa: E402
-from hud import HudState, local_now, render_hud  # noqa: E402
+from hud import HudState, local_now, render_centered_hud, render_hud  # noqa: E402
 from pixels import from_rgb565, to_rgb565  # noqa: E402
 
 
@@ -63,7 +63,15 @@ def main(argv: list[str] | None = None) -> None:
     cfg = Config.load()
     if args.seed is not None:
         cfg.seed = args.seed
-    engine = math_shaders.InfiniteArtEngine(cfg.width, cfg.height, seed=cfg.seed, speed=cfg.speed)
+    engine = (
+        math_shaders.RetroArcadeEngine(
+            cfg.width, cfg.height, seed=cfg.seed, speed=cfg.speed
+        )
+        if cfg.source == "retro"
+        else math_shaders.InfiniteArtEngine(
+            cfg.width, cfg.height, seed=cfg.seed, speed=cfg.speed
+        )
+    )
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -71,15 +79,17 @@ def main(argv: list[str] | None = None) -> None:
     for index in range(args.frames):
         t = index * args.step
         frame = engine.render(t)
-        math_shaders.swirling_frame(
-            frame,
-            t,
-            thickness=cfg.border_thickness,
-            seed_phase=engine.hue_origin,
-            intensity=cfg.border_intensity,
-        )
+        if cfg.source != "retro":
+            math_shaders.swirling_frame(
+                frame,
+                t,
+                thickness=cfg.border_thickness,
+                seed_phase=engine.hue_origin,
+                intensity=cfg.border_intensity,
+            )
         if cfg.hud:
-            render_hud(
+            hud_renderer = render_centered_hud if cfg.source == "retro" else render_hud
+            hud_renderer(
                 frame,
                 HudState(
                     server_temp_c=args.server_temp,

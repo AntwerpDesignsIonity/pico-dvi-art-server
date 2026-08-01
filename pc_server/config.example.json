@@ -1,7 +1,8 @@
 {
   "host": "0.0.0.0",
   "port": 5001,
-  "width": 400,
+  "dvi_mode": "640x480",
+  "width": 320,
   "height": 240,
   "byte_order": "little",
   "fps": 20.0,

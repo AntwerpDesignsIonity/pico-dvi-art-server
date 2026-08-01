@@ -22,7 +22,7 @@ import font5x7  # noqa: E402
 import math_shaders  # noqa: E402
 import server as art_server  # noqa: E402
 from config import Config  # noqa: E402
-from hud import HudState, render_hud  # noqa: E402
+from hud import HudState, render_centered_hud, render_hud  # noqa: E402
 from pixels import HEADER_SIZE, MAGIC, from_rgb565, to_rgb565  # noqa: E402
 
 
@@ -133,6 +133,20 @@ class ShaderTests(unittest.TestCase):
         self.assertEqual(frame.max(), 0)
 
 
+class RetroArcadeTests(unittest.TestCase):
+    def test_cycles_through_five_distinct_pixel_scenes(self):
+        engine = math_shaders.RetroArcadeEngine(320, 240, seed=99)
+        frames = [
+            engine.render(index * engine.SCENE_SECONDS + 1.0)
+            for index in range(5)
+        ]
+        self.assertTrue(all(frame.shape == (240, 320, 3) for frame in frames))
+        self.assertTrue(
+            all(not np.array_equal(frames[i], frames[(i + 1) % 5]) for i in range(5))
+        )
+        self.assertTrue(all(np.array_equal(frame[0::2], frame[1::2]) for frame in frames))
+
+
 class HudTests(unittest.TestCase):
     def setUp(self):
         self.cfg = Config()
@@ -145,8 +159,8 @@ class HudTests(unittest.TestCase):
 
     def test_draws_in_the_top_right(self):
         frame = self.render(server_temp_c=17.6, local_temp_c=38.4)
-        top_right = frame[0:130, 200:400]
-        top_left = frame[0:130, 0:180]
+        top_right = frame[0:130, self.cfg.width // 2 :]
+        top_left = frame[0:130, : self.cfg.width // 3]
         bottom = frame[160:, :]
         self.assertGreater(top_right.max(), 0)
         self.assertEqual(top_left.max(), 0)
@@ -167,6 +181,16 @@ class HudTests(unittest.TestCase):
         frame = self.render(server_temp_c=1.0)
         self.assertGreater(frame.max(), 0)
 
+    def test_centered_hud_has_no_panel_or_border(self):
+        frame = np.zeros((self.cfg.height, self.cfg.width, 3), dtype=np.uint8)
+        render_centered_hud(
+            frame,
+            HudState(now=self.now, server_temp_c=17.6, local_temp_c=38.4),
+            self.cfg,
+        )
+        self.assertGreater(frame[60:185, self.cfg.width // 4 : -self.cfg.width // 4].max(), 0)
+        self.assertEqual(frame[:20, :20].max(), 0)
+
 
 class ConfigTests(unittest.TestCase):
     def test_env_coercion(self):
@@ -178,11 +202,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.seed, 77)
 
     def test_frame_size(self):
-        self.assertEqual(Config().frame_size, 192000)
+        cfg = Config()
+        self.assertEqual(cfg.frame_size, cfg.width * cfg.height * 2)
+        self.assertEqual(cfg.frame_size, 153600)
 
     def test_validation(self):
         cfg = Config()
         cfg.byte_order = "middle"
+        with self.assertRaises(ValueError):
+            cfg.validate()
+        cfg.byte_order = "big"
         with self.assertRaises(ValueError):
             cfg.validate()
 
@@ -191,6 +220,12 @@ class ConfigTests(unittest.TestCase):
         cfg.source = "hybrid"
         cfg.validate()
         self.assertTrue(cfg.ai_enabled)
+
+    def test_retro_source_is_valid(self):
+        cfg = Config()
+        cfg.source = "retro"
+        cfg.validate()
+        self.assertFalse(cfg.ai_enabled)
 
 
 class PromptTests(unittest.TestCase):

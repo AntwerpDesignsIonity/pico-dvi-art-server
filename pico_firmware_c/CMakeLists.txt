@@ -51,6 +51,10 @@ target_compile_definitions(pico_dvi_art_client PRIVATE
     DVI_MODE_800X480=$<BOOL:${DVI_MODE_800X480}>
     CYW43_HOST_NAME="pico-dvi-art"
     CYW43_PIO_CLOCK_DIV_INT=${CYW43_PIO_CLOCK_DIV}
+    # The SDK default CDC RX ring is only 256 bytes. A full RGB565 frame is
+    # 153,600 bytes, so Windows otherwise fills the ring and times out before
+    # core0 can drain it between DVI refreshes.
+    CFG_TUD_CDC_RX_BUFSIZE=16384
     # Give a USB console a few seconds to attach so the boot log - which
     # explains any Wi-Fi failure - is not lost on a headless appliance.
     PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS=8000

@@ -1,8 +1,8 @@
 # pico-dvi-art-server
 
-Infinite, never-repeating generative art streamed over Wi-Fi to a **Raspberry Pi Pico W**
-driving a **Pico DVI LCD 10.1** (400x240 RGB565 framebuffer), with a live HUD and
-GitHub OTA firmware updates.
+Infinite generative art streamed over Wi-Fi or USB to a **Raspberry Pi Pico 2 W**
+driving a **Waveshare PICO-DVI-LCD 10.1**. The native desktop application controls
+the art, HUD, Wi-Fi provisioning, firmware builds, flashing and OTA.
 
 ![preview frame](docs/preview.png)
 
@@ -10,11 +10,16 @@ GitHub OTA firmware updates.
   random per-run seed mean the pattern has no period.
 * **Colour-swirling animated frame** around the edge with two counter-rotating comets.
 * **HUD, top right:** clock, date underneath, then the **server** temperature
-  (weather API or host CPU) and the **actual RP2040 chipset** temperature reported by
+  (weather API or host CPU) and the **actual RP2350 chipset** temperature reported by
   the Pico itself.
-* **Server issues everything** over Wi-Fi: pixels, and OTA "go update yourself" commands.
-* **OTA over GitHub** with staged downloads, automatic rollback and a blocked-version
-  guard so a bad push can never brick the display.
+* **Retro arcade cycle:** five original colorful faux-3D pixel-art scenes (falling
+  blocks, maze chase, tank arena, platform runner and ice climb), with the clock,
+  date and temperatures centered and no border.
+* **Automatic dual transport:** Wi-Fi TCP is used when available; USB CDC carries
+  the same real RGB565 frames when Wi-Fi is unavailable.
+* **Working Push OTA:** builds the selected C firmware, releases USB cleanly, enters
+  BOOTSEL, copies the UF2 and resumes streaming. Network-only devices receive the
+  reboot command over TCP before the same UF2 copy.
 * Optional **AI image mode** (rotating prompt template -> image API -> 400x240 RGB565).
 
 ---
@@ -24,37 +29,21 @@ GitHub OTA firmware updates.
 Double-click **`START.bat`**. That is the whole procedure.
 
 It finds Python (installing nothing you already have), installs the dependencies the
-first time, launches a background USB watcher, and starts streaming. There are no
-menus, no port numbers to type and no options to pick. Close the window to stop it.
+first time, then opens the native **Pico DVI Art Studio**. The server runs inside the
+application; there is no browser, separate console server or port-selection step.
 
 ```
 START.bat
   ├── finds Python 3.9+ (PATH, py launcher, or %LOCALAPPDATA%\Programs\Python)
   ├── pip install -r pc_server/requirements.txt mpremote pyserial   (first run only)
-  ├── tools/flash_pico.py --auto --watch 30   ← background, provisions any Pico
-  └── pc_server/server.py                     ← streams art, auto-restarts on crash
+  └── app/studio.py                 ← desktop UI + server + USB/Wi-Fi transport
 ```
 
-The watcher rescans USB every 30 seconds, so you can plug the Pico in at any time —
-before or after starting — and it gets set up on its own.
-
-### What the auto-provisioner does to a board
-
-| Board state                        | Action                                                    |
-| ---------------------------------- | --------------------------------------------------------- |
-| BOOTSEL (`RPI-RP2` drive)          | downloads the latest MicroPython `.uf2`, installs it, then copies the firmware |
-| MicroPython, wrong/no firmware     | copies the firmware and resets the board                   |
-| MicroPython, firmware already current | left alone                                              |
-| **Any other firmware**             | **never touched** — flashing would erase it permanently    |
-
-That last row is deliberate. If your display board is currently running its own
-firmware, put it in BOOTSEL mode first: unplug it, hold the **BOOTSEL** button, plug it
-back in, release. An `RPI-RP2` drive appears and the installer takes over by itself.
-
-Wi-Fi credentials and the server address live in `pico_firmware/device_secrets.py`,
-which is git-ignored and never uploaded. The provisioner creates it on the first run
-(from the `PICO_WIFI_SSID` / `PICO_WIFI_PASS` environment variables when running
-unattended) and keeps `SERVER_IP` pointing at this PC's current LAN address.
+Select `retro`, `shader`, `ai` or `hybrid` under **Art source**. The **Network** tab
+contains editable Wi-Fi SSID/password fields. Credentials are stored only in
+`pico_firmware/device_secrets.py`, which is git-ignored and never uploaded. Use
+**Build + flash firmware** after changing Wi-Fi settings. Only USB VID `2E8A`
+(Raspberry Pi) is ever selected; attached ESP boards are ignored.
 
 Advanced use, if you ever want it:
 

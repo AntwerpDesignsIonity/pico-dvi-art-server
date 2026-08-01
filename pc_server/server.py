@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import math_shaders  # noqa: E402
 from ai_prompts import AiFrameSource  # noqa: E402
 from config import Config  # noqa: E402
-from hud import HudState, local_now, render_hud  # noqa: E402
+from hud import HudState, local_now, render_centered_hud, render_hud  # noqa: E402
 from pixels import HEADER_SIZE, MAGIC, to_rgb565  # noqa: E402
 from temperature import TemperatureProvider  # noqa: E402
 
@@ -71,6 +71,9 @@ class ArtServer:
         self.engine = math_shaders.InfiniteArtEngine(
             cfg.width, cfg.height, seed=cfg.seed, speed=cfg.speed
         )
+        self.retro_engine = math_shaders.RetroArcadeEngine(
+            cfg.width, cfg.height, seed=cfg.seed, speed=cfg.speed
+        )
         self.temps = TemperatureProvider(
             source=cfg.temp_source,
             latitude=cfg.latitude,
@@ -88,7 +91,11 @@ class ArtServer:
     def render_frame(self, session: ClientSession | None = None) -> np.ndarray:
         cfg = self.cfg
         t = time.monotonic() - self._t0
-        frame = self.engine.render(t)
+        frame = (
+            self.retro_engine.render(t)
+            if cfg.source == "retro"
+            else self.engine.render(t)
+        )
 
         if self.ai is not None:
             ai_frame = self.ai.frame
@@ -100,13 +107,14 @@ class ArtServer:
                     pulse = 0.45 + 0.25 * np.sin(t * 0.11)
                     frame = math_shaders.blend(frame, ai_frame, float(pulse))
 
-        math_shaders.swirling_frame(
-            frame,
-            t,
-            thickness=cfg.border_thickness,
-            seed_phase=self.engine.hue_origin,
-            intensity=cfg.border_intensity,
-        )
+        if cfg.source != "retro":
+            math_shaders.swirling_frame(
+                frame,
+                t,
+                thickness=cfg.border_thickness,
+                seed_phase=self.engine.hue_origin,
+                intensity=cfg.border_intensity,
+            )
 
         if cfg.hud:
             local_temp = session.snapshot()[0] if session else None
@@ -117,7 +125,10 @@ class ArtServer:
                 server_label=cfg.temp_label_server,
                 local_label=cfg.temp_label_local,
             )
-            render_hud(frame, state, cfg)
+            if cfg.source == "retro":
+                render_centered_hud(frame, state, cfg)
+            else:
+                render_hud(frame, state, cfg)
         return frame
 
     def frame_bytes(self, session: ClientSession | None = None) -> bytes:
@@ -359,7 +370,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     parser.add_argument("--fps", type=float)
-    parser.add_argument("--source", choices=["shader", "ai", "hybrid"])
+    parser.add_argument("--source", choices=["shader", "retro", "ai", "hybrid"])
     parser.add_argument("--speed", type=float)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--byte-order", dest="byte_order", choices=["little", "big"])
