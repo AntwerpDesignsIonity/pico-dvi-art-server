@@ -220,6 +220,13 @@ class ConfigTests(unittest.TestCase):
         cfg.byte_order = "big"
         with self.assertRaises(ValueError):
             cfg.validate()
+        cfg.byte_order = "little"
+        cfg.dvi_invert_diffpairs = 2
+        with self.assertRaises(ValueError):
+            cfg.validate()
+
+    def test_normal_tmds_polarity_is_the_safe_default(self):
+        self.assertEqual(Config().dvi_invert_diffpairs, 0)
 
     def test_ai_source_enables_worker(self):
         cfg = Config()

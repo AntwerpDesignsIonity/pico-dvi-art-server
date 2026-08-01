@@ -38,6 +38,7 @@ class Config:
     # The C firmware renders locally; these values drive the desktop preview
     # and remain compatible with legacy frame-streaming firmware.
     dvi_mode: str = "640x480"
+    dvi_invert_diffpairs: int = 0
     width: int = 320
     height: int = 240
     byte_order: str = "little"  # legacy frame protocol and preview packing
@@ -117,6 +118,8 @@ class Config:
             raise ValueError("byte_order must be 'little' for the Pico firmware")
         if self.dvi_mode not in DVI_MODES:
             raise ValueError(f"dvi_mode must be one of {sorted(DVI_MODES)}")
+        if self.dvi_invert_diffpairs not in (0, 1):
+            raise ValueError("dvi_invert_diffpairs must be 0 or 1")
         # The framebuffer is always half the DVI mode in each axis, because the
         # firmware pixel-doubles it. Deriving it here means the PC and the Pico
         # can never disagree about the frame size.

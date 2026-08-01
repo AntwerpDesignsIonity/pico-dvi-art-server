@@ -42,6 +42,11 @@ contains editable Wi-Fi SSID/password fields. Credentials are stored only in
 **Build + flash firmware** after changing Wi-Fi settings. Only USB VID `2E8A`
 (Raspberry Pi) is ever selected; attached ESP boards are ignored.
 
+If the panel glitches or stays one solid colour (often red), use `640x480` and
+set **TMDS polarity** to `0`, then **Build + flash firmware** again. A solid
+colour means the LCD receiver did not lock to DVI. If `0` still gives a solid
+screen, try polarity `1`; this depends on the carrier's differential-pair wiring.
+
 Advanced use, if you ever want it:
 
 ```

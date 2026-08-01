@@ -162,6 +162,7 @@ def ensure_firewall_rule(port: int, log) -> None:
 SETTING_GROUPS: list[tuple[str, list[tuple[str, str, str, object]]]] = [
     ("Display", [
         ("dvi_mode", "Panel mode", "choice", sorted(DVI_MODES)),
+        ("dvi_invert_diffpairs", "TMDS polarity (0 normal, 1 inverted)", "choice", [0, 1]),
         ("fps", "Preview frames/second", "float", None),
     ]),
     ("Desktop preview", [
@@ -326,7 +327,8 @@ class UsbDeviceMonitor:
             mode = MODE_STAMP.read_text(encoding="utf-8").strip()
         except OSError:
             mode = ""
-        if not mode.startswith("640x480") or not SAFE_UF2.exists():
+        polarity = self.studio.cfg.dvi_invert_diffpairs
+        if mode != f"640x480|invert={polarity}" or not SAFE_UF2.exists():
             self.studio.log("[usb] building safe 640x480 recovery firmware")
             result = subprocess.run(
                 [
@@ -334,6 +336,8 @@ class UsbDeviceMonitor:
                     str(REPO / "tools" / "build_firmware.py"),
                     "--mode",
                     "640x480",
+                    "--invert-diffpairs",
+                    str(polarity),
                 ],
                 cwd=str(REPO),
                 capture_output=True,
@@ -631,7 +635,8 @@ class Studio(tk.Tk):
         if python is None:
             return
         args = [python, str(REPO / "tools" / "build_firmware.py"), "--flash",
-                "--mode", self.cfg.dvi_mode]
+                "--mode", self.cfg.dvi_mode, "--invert-diffpairs",
+                str(self.cfg.dvi_invert_diffpairs)]
         self._run_tool(args, "firmware build + flash", release_usb=True)
 
     def push_ota(self) -> None:
@@ -651,6 +656,7 @@ class Studio(tk.Tk):
             args = [
                 python, str(REPO / "tools" / "build_firmware.py"), "--flash",
                 "--mode", self.cfg.dvi_mode,
+                "--invert-diffpairs", str(self.cfg.dvi_invert_diffpairs),
             ]
             self._run_tool(args, "OTA build + USB flash", release_usb=True)
             return
@@ -663,6 +669,7 @@ class Studio(tk.Tk):
         args = [
             python, str(REPO / "tools" / "build_firmware.py"),
             "--mode", self.cfg.dvi_mode,
+            "--invert-diffpairs", str(self.cfg.dvi_invert_diffpairs),
         ]
         self._run_tool(args, "OTA build", network_ota=True, python=python)
 
@@ -706,6 +713,8 @@ class Studio(tk.Tk):
                             "--flash",
                             "--mode",
                             self.cfg.dvi_mode,
+                            "--invert-diffpairs",
+                            str(self.cfg.dvi_invert_diffpairs),
                         ]
                         proc = subprocess.Popen(
                             flash_args, cwd=str(REPO), stdout=subprocess.PIPE,
