@@ -51,7 +51,87 @@ RASPBERRY_PI_VID = 0x2E8A
 DEVICE_SECRETS = REPO / "pico_firmware" / "device_secrets.py"
 SAFE_UF2 = REPO / "pico_firmware_c" / "build" / "pico_dvi_art_client.uf2"
 MODE_STAMP = REPO / "pico_firmware_c" / "build" / "dvi_mode.stamp"
+FIREWALL_RULE_NAME = "Pico DVI Art Server"
 _INSTANCE_MUTEX = None
+
+
+def _firewall_rule_exists(port: int) -> bool:
+    """Query Windows Firewall for our inbound rule. Never needs admin rights."""
+    if sys.platform != "win32":
+        return True
+    try:
+        result = subprocess.run(
+            [
+                "netsh", "advfirewall", "firewall", "show", "rule",
+                f"name={FIREWALL_RULE_NAME}",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and str(port) in result.stdout
+
+
+def ensure_firewall_rule(port: int, log) -> None:
+    """Open the TCP port inbound so the Pico's Wi-Fi connection is not
+    silently dropped when Windows classifies the LAN as a Public network.
+
+    Adding a firewall rule always requires admin rights. We try the direct
+    (non-elevated) command first - it succeeds when the app is already run
+    as admin - and only fall back to a one-time UAC prompt otherwise.
+    """
+    if sys.platform != "win32":
+        return
+    if _firewall_rule_exists(port):
+        log(f"[firewall] inbound rule for port {port} already present")
+        return
+
+    add_args = (
+        "advfirewall firewall add rule "
+        f'name="{FIREWALL_RULE_NAME}" dir=in action=allow protocol=TCP '
+        f"localport={port} profile=any"
+    )
+    try:
+        direct = subprocess.run(
+            ["netsh"] + add_args.split(), capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        direct = None
+        log(f"[firewall] could not run netsh directly: {exc}")
+
+    if direct is not None and direct.returncode == 0:
+        log(f"[firewall] opened inbound TCP {port} for the Pico stream")
+        return
+
+    log(
+        f"[firewall] requesting one-time admin approval to open TCP {port} "
+        "(Windows will show a Yes/No prompt)"
+    )
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "netsh", add_args, None, 0
+        )
+    except OSError as exc:
+        log(f"[firewall] elevation failed: {exc}")
+        return
+    # ShellExecuteW returns a value > 32 on success at launch time; the
+    # actual netsh run happens asynchronously once the user approves.
+    if rc <= 32:
+        log(
+            "[firewall] elevation prompt did not launch - open the port "
+            "manually or run studio.py as Administrator"
+        )
+        return
+
+    for _ in range(20):  # give the user a few seconds to click "Yes"
+        time.sleep(0.5)
+        if _firewall_rule_exists(port):
+            log(f"[firewall] opened inbound TCP {port} for the Pico stream")
+            return
+    log(
+        f"[firewall] rule for port {port} still missing - approve the UAC "
+        "prompt, or add it manually if it was dismissed"
+    )
 
 # (field name, label, widget kind, options)
 SETTING_GROUPS: list[tuple[str, list[tuple[str, str, str, object]]]] = [
@@ -468,6 +548,7 @@ class Studio(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("Invalid configuration", str(exc))
             return
+        ensure_firewall_rule(self.cfg.port, self.log)
         self.server = ArtServer(self.cfg)
         self.server_thread = threading.Thread(
             target=self._serve, name="art-server", daemon=True
