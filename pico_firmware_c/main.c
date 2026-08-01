@@ -75,6 +75,10 @@
 #define WIFI_BACKOFF_MIN_MS 3000
 #define WIFI_BACKOFF_MAX_MS 60000
 #define JOIN_FAILURES_BEFORE_RESET 3
+// lwIP retransmits an unanswered SYN with a growing backoff; give a connect
+// long enough to survive that before calling it dead.
+#define TCP_CONNECT_WINDOW_MS 12000
+#define TCP_FAILURES_BEFORE_REJOIN 3
 
 struct dvi_inst dvi0;
 static bool dvi_running = false;
@@ -641,6 +645,7 @@ int main(void) {
     uint32_t wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
     bool scanned_once = false;
     uint32_t join_failures = 0;
+    uint32_t tcp_failures = 0;
     absolute_time_t next_stat  = make_timeout_time_ms(5000);
     uint standby_frame = 0;
     uint32_t shown = 0;
@@ -665,12 +670,36 @@ int main(void) {
             close_link();
             int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
             printf("[net] retry: wifi status %d, ip %s\n", status, ip_string());
+
+            // Being associated is not the same as being reachable. A mesh node
+            // will happily hand out a DHCP lease and then not bridge the client
+            // onto the wired LAN, so the server is simply invisible and every
+            // TCP connect dies of silence. Nothing on this side can fix that
+            // link, but dropping the association and taking a fresh one often
+            // lands us on a node that does forward - so stop trusting an
+            // association that has never once carried a packet.
+            if (status == CYW43_LINK_UP && tcp_failures >= TCP_FAILURES_BEFORE_REJOIN) {
+                tcp_failures = 0;
+                printf("[net] associated but the server never answers - "
+                       "dropping this association and rejoining\n");
+                snprintf(status_line, sizeof(status_line), "NO ROUTE TO SERVER - REJOINING");
+                cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+                sleep_ms(500);
+                watchdog_update();
+                status = CYW43_LINK_DOWN;
+            }
+
             bool associated = (status == CYW43_LINK_UP) || wifi_join(JOIN_TIMEOUT_MS);
             if (associated) {
                 wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
                 join_failures = 0;
+                tcp_failures++;
                 connect_to_server();
-                next_retry = make_timeout_time_ms(3000);
+                // lwIP retransmits the SYN with a growing backoff, so a healthy
+                // but momentarily busy network can take several seconds to
+                // answer. Aborting after three would throw away connections
+                // that were about to succeed.
+                next_retry = make_timeout_time_ms(TCP_CONNECT_WINDOW_MS);
             } else {
                 // Back off exponentially. Association requests fired every few
                 // seconds get the MAC rate-limited by the AP, which is exactly
@@ -720,6 +749,7 @@ int main(void) {
 
         if (frame_ready) {
             frame_ready = false;
+            tcp_failures = 0;             // this association demonstrably works
             front_idx ^= 1;               // publish the freshly received frame
             shown++;
             fps_frames++;

@@ -132,8 +132,21 @@ class ArtServer:
             self.ai.start()
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((cfg.host, cfg.port))
+        # Windows SO_REUSEADDR lets a second process silently steal a port that
+        # is already bound, so a stale instance can swallow every connection and
+        # the board just times out. SO_EXCLUSIVEADDRUSE makes the clash loud.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind((cfg.host, cfg.port))
+        except OSError as exc:
+            server.close()
+            raise RuntimeError(
+                f"port {cfg.port} is already in use - another copy of the art "
+                f"server is still running. Close it and start again ({exc})."
+            ) from exc
         server.listen(4)
         server.settimeout(1.0)
 
