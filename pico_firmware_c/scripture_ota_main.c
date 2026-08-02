@@ -1,5 +1,5 @@
 /*
- * pico-dvi scripture edition V3 (OTA) - local-render C firmware for a
+ * pico-dvi scripture edition V4 (OTA) - local-render C firmware for a
  * Pico 2 W (RP2350) in a Waveshare PICO-DVI-LCD carrier.
  *
  * Same ambient scripture display as V2, plus over-the-air updates: the
@@ -27,17 +27,19 @@
 #include "common_dvi_pin_configs.h"
 
 #include "verses_ota.h"
+#include "ionity_logo_bitmap.h"
 
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 
-#define FW_VERSION "3.0.0"
+#define FW_VERSION "4.0.0"
 
 #ifndef NOTE_WIFI_ENABLED
 #define NOTE_WIFI_ENABLED 0
 #endif
 #if NOTE_WIFI_ENABLED
 #include "pico/cyw43_arch.h"
+#include "lwip/dns.h"
 #include "lwip/tcp.h"
 #include "lwip/apps/mdns.h"
 #endif
@@ -211,6 +213,19 @@ static void draw_text(uint16_t *buf, int x, int y, const char *s, int scale, uin
     for (; *s; ++s) {
         draw_char(buf, x, y, *s, scale, rgb);
         x += 6 * scale;
+    }
+}
+
+static void draw_bitmap565(uint16_t *buf, int x, int y, int w, int h,
+                           const uint16_t *bmp) {
+    for (int py = 0; py < h; ++py) {
+        for (int px = 0; px < w; ++px) {
+            int dx = x + px;
+            int dy = y + py;
+            if (dx < 0 || dx >= FRAME_WIDTH || dy < 0 || dy >= FRAME_HEIGHT) continue;
+            uint16_t c = bmp[py * w + px];
+            if (c) buf[dy * FRAME_WIDTH + dx] = c;
+        }
     }
 }
 
@@ -404,6 +419,320 @@ static volatile int net_up = 0;
 static int net_started = 0;
 static struct tcp_pcb *note_listen_pcb;
 static char http_out[1400];
+static uint32_t net_frame_seen = 0;
+
+typedef enum {
+    STREAM_RSS,
+    STREAM_WEATHER,
+} StreamKind;
+
+typedef struct {
+    const char *tag;
+    const char *host;
+    const char *path;
+    StreamKind kind;
+} StreamFeed;
+
+static const StreamFeed stream_feeds[] = {
+    {"BBC NEWS", "feeds.bbci.co.uk", "/news/rss.xml", STREAM_RSS},
+    {"REUTERS", "feeds.reuters.com", "/reuters/topNews", STREAM_RSS},
+    {"CNN WORLD", "rss.cnn.com", "/rss/edition.rss", STREAM_RSS},
+    {"WEATHER", "wttr.in", "/?format=j1", STREAM_WEATHER},
+};
+static uint32_t stream_feed_idx = 0;
+static uint32_t stream_next_refresh_ms = 0;
+static volatile int stream_busy = 0;
+static char stream_rss[96] = "SCRIPTURE";
+static char stream_weather[64] = "OUTSIDE";
+static char stream_place[32] = "";
+static int stream_temp_c10 = 0;
+
+typedef struct {
+    struct tcp_pcb *pcb;
+    ip_addr_t ip;
+    volatile int resolved;
+    volatile int connected;
+    volatile int done;
+    volatile int ok;
+    volatile err_t err;
+    char host[64];
+    char path[128];
+    char *body;
+    int body_cap;
+    int body_len;
+    int header_done;
+    char header[512];
+    int header_len;
+} HttpGetCtx;
+
+static void text_clean(char *s) {
+    int w = 0;
+    for (int i = 0; s[i]; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        if (c < 0x20 || c > 0x7A) continue;
+        if (c == ' ' && w > 0 && s[w - 1] == ' ') continue;
+        s[w++] = (char)c;
+    }
+    while (w > 0 && s[w - 1] == ' ') --w;
+    s[w] = '\0';
+}
+
+static void decode_html_entities(char *s) {
+    char out[96];
+    int w = 0;
+    for (int i = 0; s[i] && w < (int)sizeof(out) - 1; ++i) {
+        if (s[i] == '&') {
+            if (!strncmp(s + i, "&amp;", 5)) { out[w++] = '&'; i += 4; continue; }
+            if (!strncmp(s + i, "&lt;", 4)) { out[w++] = '<'; i += 3; continue; }
+            if (!strncmp(s + i, "&gt;", 4)) { out[w++] = '>'; i += 3; continue; }
+            if (!strncmp(s + i, "&quot;", 6)) { out[w++] = '"'; i += 5; continue; }
+            if (!strncmp(s + i, "&#39;", 5)) { out[w++] = '\''; i += 4; continue; }
+        }
+        out[w++] = s[i];
+    }
+    out[w] = '\0';
+    snprintf(s, 96, "%s", out);
+}
+
+static const char *json_find_string(const char *text, const char *key) {
+    const char *p = strstr(text, key);
+    if (!p) return NULL;
+    p = strchr(p, ':');
+    if (!p) return NULL;
+    p = strchr(p, '"');
+    if (!p) return NULL;
+    return p + 1;
+}
+
+static void json_copy_value(const char *start, char *dst, int cap) {
+    int w = 0;
+    for (int i = 0; start[i] && w < cap - 1; ++i) {
+        char c = start[i];
+        if (c == '"' || c == '\r' || c == '\n') break;
+        if (c == '\\' && start[i + 1]) {
+            ++i;
+            c = start[i];
+        }
+        if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) continue;
+        dst[w++] = c;
+    }
+    dst[w] = '\0';
+    text_clean(dst);
+}
+
+static void parse_weather(const char *body) {
+    const char *area = strstr(body, "\"nearest_area\"");
+    if (area) area = strstr(area, "\"value\"");
+    if (area) {
+        json_copy_value(area, stream_place, sizeof(stream_place));
+    }
+    const char *temp = strstr(body, "\"temp_C\"");
+    if (temp) {
+        temp = strchr(temp, ':');
+        if (temp) {
+            ++temp;
+            while (*temp == ' ' || *temp == '"') ++temp;
+            stream_temp_c10 = (int)(strtol(temp, NULL, 10) * 10);
+        }
+    }
+    if (stream_place[0]) {
+        snprintf(stream_weather, sizeof(stream_weather), "%s %d.%dC",
+                 stream_place, stream_temp_c10 / 10, iabs(stream_temp_c10 % 10));
+    } else {
+        snprintf(stream_weather, sizeof(stream_weather), "OUTSIDE %d.%dC",
+                 stream_temp_c10 / 10, iabs(stream_temp_c10 % 10));
+    }
+}
+
+static void parse_rss(const char *body, const char *tag) {
+    const char *item = strstr(body, "<item>");
+    if (!item) item = body;
+    const char *title = strstr(item, "<title>");
+    if (!title) return;
+    title += 7;
+    const char *end = strstr(title, "</title>");
+    if (!end || end <= title) return;
+    int len = (int)(end - title);
+    if (len > 140) len = 140;
+    char tmp[144];
+    memcpy(tmp, title, (size_t)len);
+    tmp[len] = '\0';
+    decode_html_entities(tmp);
+    text_clean(tmp);
+    snprintf(stream_rss, sizeof(stream_rss), "%s: %s", tag, tmp);
+    if ((int)strlen(stream_rss) >= (int)sizeof(stream_rss)) {
+        stream_rss[sizeof(stream_rss) - 1] = '\0';
+    }
+}
+
+static void http_client_close(HttpGetCtx *ctx) {
+    if (ctx->pcb) {
+        tcp_arg(ctx->pcb, NULL);
+        tcp_recv(ctx->pcb, NULL);
+        tcp_err(ctx->pcb, NULL);
+        tcp_close(ctx->pcb);
+        ctx->pcb = NULL;
+    }
+}
+
+static void http_client_fail(HttpGetCtx *ctx, err_t err) {
+    ctx->err = err;
+    ctx->ok = 0;
+    ctx->done = 1;
+    http_client_close(ctx);
+}
+
+static err_t http_client_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
+    HttpGetCtx *ctx = (HttpGetCtx *)arg;
+    if (err != ERR_OK) {
+        if (p) pbuf_free(p);
+        http_client_fail(ctx, err);
+        return ERR_OK;
+    }
+    if (!p) {
+        ctx->ok = 1;
+        ctx->done = 1;
+        http_client_close(ctx);
+        return ERR_OK;
+    }
+
+    for (struct pbuf *q = p; q; q = q->next) {
+        const uint8_t *data = (const uint8_t *)q->payload;
+        uint32_t len = q->len;
+        while (len > 0) {
+            if (!ctx->header_done) {
+                while (len > 0 && ctx->header_len < (int)sizeof(ctx->header) - 1) {
+                    ctx->header[ctx->header_len++] = (char)*data++;
+                    len -= 1;
+                    if (ctx->header_len >= 4 &&
+                        memcmp(ctx->header + ctx->header_len - 4, "\r\n\r\n", 4) == 0) {
+                        ctx->header[ctx->header_len] = '\0';
+                        ctx->header_done = 1;
+                        break;
+                    }
+                }
+                if (!ctx->header_done) break;
+            }
+            while (len > 0 && ctx->body_len < ctx->body_cap - 1) {
+                ctx->body[ctx->body_len++] = (char)*data++;
+                len -= 1;
+            }
+            break;
+        }
+    }
+    tcp_recved(pcb, p->tot_len);
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+static err_t http_client_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
+    HttpGetCtx *ctx = (HttpGetCtx *)arg;
+    if (err != ERR_OK) {
+        http_client_fail(ctx, err);
+        return err;
+    }
+    int n = snprintf(ctx->header, sizeof(ctx->header),
+                     "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Ionity\r\n"
+                     "Connection: close\r\nAccept: */*\r\n\r\n",
+                     ctx->path, ctx->host);
+    err_t wr = tcp_write(pcb, ctx->header, (u16_t)n, TCP_WRITE_FLAG_COPY);
+    if (wr != ERR_OK) {
+        http_client_fail(ctx, wr);
+        return wr;
+    }
+    tcp_output(pcb);
+    ctx->connected = 1;
+    return ERR_OK;
+}
+
+static void http_client_err(void *arg, err_t err) {
+    HttpGetCtx *ctx = (HttpGetCtx *)arg;
+    if (!ctx) return;
+    ctx->err = err;
+    ctx->ok = 0;
+    ctx->done = 1;
+    ctx->pcb = NULL;
+}
+
+static void http_dns_found(const char *name, const ip_addr_t *ipaddr, void *arg) {
+    (void)name;
+    HttpGetCtx *ctx = (HttpGetCtx *)arg;
+    if (ipaddr) {
+        ctx->ip = *ipaddr;
+        ctx->resolved = 1;
+    } else {
+        http_client_fail(ctx, ERR_ARG);
+    }
+}
+
+static int http_get_text(const char *host, const char *path, char *body, int body_cap, uint32_t timeout_ms) {
+    HttpGetCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    snprintf(ctx.host, sizeof(ctx.host), "%s", host);
+    snprintf(ctx.path, sizeof(ctx.path), "%s", path);
+    ctx.body = body;
+    ctx.body_cap = body_cap;
+
+    err_t dr = dns_gethostbyname(host, &ctx.ip, http_dns_found, &ctx);
+    if (dr == ERR_ARG) return 0;
+    if (dr == ERR_INPROGRESS) {
+        absolute_time_t deadline = delayed_by_ms(get_absolute_time(), timeout_ms);
+        while (!ctx.resolved) {
+            cyw43_arch_poll();
+            watchdog_update();
+            if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) return 0;
+            sleep_ms(1);
+        }
+    } else if (dr != ERR_OK) {
+        return 0;
+    }
+
+    ctx.pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (!ctx.pcb) return 0;
+    tcp_arg(ctx.pcb, &ctx);
+    tcp_err(ctx.pcb, http_client_err);
+    tcp_recv(ctx.pcb, http_client_recv);
+    tcp_sent(ctx.pcb, NULL);
+    err_t cr = tcp_connect(ctx.pcb, &ctx.ip, 80, http_client_connected);
+    if (cr != ERR_OK) {
+        http_client_close(&ctx);
+        return 0;
+    }
+
+    absolute_time_t deadline = delayed_by_ms(get_absolute_time(), timeout_ms);
+    while (!ctx.done) {
+        cyw43_arch_poll();
+        watchdog_update();
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            http_client_fail(&ctx, ERR_TIMEOUT);
+            break;
+        }
+        sleep_ms(1);
+    }
+    if (!ctx.done) http_client_close(&ctx);
+    body[ctx.body_len] = '\0';
+    return ctx.ok;
+}
+
+static void refresh_stream_data(void) {
+    if (stream_busy || !net_up) return;
+    stream_busy = 1;
+    char buf[8192];
+    const StreamFeed *feed = &stream_feeds[stream_feed_idx % (sizeof(stream_feeds) / sizeof(stream_feeds[0]))];
+    if (feed->kind == STREAM_WEATHER) {
+        if (http_get_text(feed->host, feed->path, buf, (int)sizeof(buf), 12000)) {
+            parse_weather(buf);
+        }
+    } else {
+        if (http_get_text(feed->host, feed->path, buf, (int)sizeof(buf), 12000)) {
+            parse_rss(buf, feed->tag);
+        }
+    }
+    stream_feed_idx += 1;
+    stream_next_refresh_ms = to_ms_since_boot(get_absolute_time()) + 15u * 60u * 1000u;
+    stream_busy = 0;
+}
 
 static void note_set(const char *raw) {
     int n = 0;
@@ -675,6 +1004,7 @@ static void net_task(uint32_t frame) {
             snprintf(net_ip, sizeof(net_ip), "%s", ip4addr_ntoa(addr));
             net_up = 1;
             printf("[note] wifi up, note board at http://%s/\n", net_ip);
+            stream_next_refresh_ms = 0;
         }
         if (!net_started) {
             note_server_start();
@@ -683,6 +1013,8 @@ static void net_task(uint32_t frame) {
             mdns_resp_add_netif(netif_default, "ionity-scripture");
             net_started = 1;
         }
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        if (now_ms >= stream_next_refresh_ms) refresh_stream_data();
     } else if (status == CYW43_LINK_FAIL || status == CYW43_LINK_NONET ||
                status == CYW43_LINK_BADAUTH) {
         net_up = 0;
@@ -692,7 +1024,6 @@ static void net_task(uint32_t frame) {
         net_up = 0;
     }
 }
-
 #endif // NOTE_WIFI_ENABLED
 
 // ---------------------------------------------------------------- verse flow
@@ -894,7 +1225,23 @@ static void render_scripture(uint16_t *buf, uint32_t frame) {
     fill_rect(buf, 0, 18, FRAME_WIDTH, 1, gold_dim);
     snprintf(info, sizeof(info), "%04d-%02d-%02d", now.year, now.month, now.day);
     draw_text(buf, 6, 6, info, 1, RGB565(170, 180, 210));
-    draw_text(buf, (FRAME_WIDTH - 9 * 6) / 2, 6, "SCRIPTURE", 1, gold);
+    {
+        const char *headline = stream_rss[0] ? stream_rss : "SCRIPTURE";
+        int headline_w = (int)strlen(headline) * 6;
+        int cx = (FRAME_WIDTH - headline_w) / 2;
+        if (headline_w <= FRAME_WIDTH - 120) {
+            draw_text(buf, cx, 6, headline, 1, gold);
+        } else {
+            int span = headline_w + 48;
+            int off = (int)((frame / 2u) % (uint32_t)span);
+            for (int c = 0; headline[c]; ++c) {
+                int px = 60 + FRAME_WIDTH / 2 - off + c * 6;
+                if (px >= 60 && px + 6 <= FRAME_WIDTH - 60) {
+                    draw_char(buf, px, 6, headline[c], 1, gold);
+                }
+            }
+        }
+    }
     snprintf(info, sizeof(info), "%02d:%02d:%02d", now.hour, now.minute, now.second);
     draw_text(buf, FRAME_WIDTH - 6 - 8 * 6, 6, info, 1, 0xFFFF);
     {
@@ -903,6 +1250,9 @@ static void render_scripture(uint16_t *buf, uint32_t frame) {
         snprintf(info, sizeof(info), "MCU %d.%dC", temp_c10 / 10, iabs(temp_c10 % 10));
         draw_text(buf, FRAME_WIDTH - 6 - (int)strlen(info) * 6, 22, info, 1,
                   RGB565(140, 200, 160));
+        if (stream_weather[0]) {
+            draw_text(buf, 8, 22, stream_weather, 1, RGB565(120, 200, 220));
+        }
     }
 
     // ---- progress bar for the current verse dwell
@@ -917,9 +1267,8 @@ static void render_scripture(uint16_t *buf, uint32_t frame) {
         const uint16_t blue = RGB565(36, 90, 200);
         int count_w;
         fill_rect(buf, 0, FRAME_HEIGHT - 16, FRAME_WIDTH, 16, RGB565(4, 5, 12));
-        fill_rect(buf, 4, FRAME_HEIGHT - 14, 48, 12, 0xFFFF);
-        stroke_rect(buf, 4, FRAME_HEIGHT - 14, 48, 12, 1, blue);
-        draw_text(buf, 8, FRAME_HEIGHT - 11, "IONITY", 1, blue);
+        draw_bitmap565(buf, 4, FRAME_HEIGHT - 19, IONITY_LOGO_W, IONITY_LOGO_H,
+                       &IONITY_LOGO_RGB565[0][0]);
         snprintf(info, sizeof(info), "VERSE %04u/%04u",
                  (unsigned)(cur_verse + 1), (unsigned)VERSE_DB_COUNT);
         count_w = (int)strlen(info) * 6;
@@ -928,7 +1277,7 @@ static void render_scripture(uint16_t *buf, uint32_t frame) {
 
         // note area between the mark and the counter
         {
-            int area_x = 58;
+            int area_x = IONITY_LOGO_W + 12;
             int area_w = FRAME_WIDTH - 6 - count_w - 6 - area_x;
             const char *msg = note_text;
             char hint[40];

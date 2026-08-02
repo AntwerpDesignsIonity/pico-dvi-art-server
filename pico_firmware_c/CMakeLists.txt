@@ -25,10 +25,10 @@ set(DVI_DEFAULT_SERIAL_CONFIG "picodvi_dvi_cfg" CACHE STRING "TMDS pin mapping")
 
 add_subdirectory(${PICODVI_PATH}/software/libdvi libdvi)
 
-# Which firmware to build: main.c (8-bit arcade V1) or scripture_main.c
-# (scripture edition V2). Same target name either way, so the build/flash
-# tooling is unchanged.
-set(APP_MAIN scripture_main.c CACHE STRING "Firmware entry: main.c or scripture_main.c")
+# Which firmware to build: scripture_main.c (scripture edition V2) or
+# scripture_ota_main.c (V4 OTA + RSS + logo). Same target name either way,
+# so the build/flash tooling is unchanged.
+set(APP_MAIN scripture_ota_main.c CACHE STRING "Firmware entry: scripture_main.c or scripture_ota_main.c")
 
 add_executable(pico_dvi_art_client ${APP_MAIN})
 

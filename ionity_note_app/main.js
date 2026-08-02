@@ -7,6 +7,8 @@ const os = require("os");
 const path = require("path");
 const zlib = require("zlib");
 
+const DEVICE_NAME = "ionity-scripture.local";
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 460,
@@ -46,11 +48,27 @@ ipcMain.handle("push-note", async (_evt, host, text) => {
 // Probe one host for the note board page.
 async function probe(host) {
   try {
-    const body = await httpGet(`http://${host}/`, 1500);
-    return body.includes("IONITY") ? host : null;
+    const body = await httpGet(`http://${host}/id`, 1500);
+    const info = JSON.parse(body);
+    if (info && info.device === "ionity-scripture") return host;
   } catch {
-    return null;
+    try {
+      const body = await httpGet(`http://${host}/`, 1500);
+      return body.includes("IONITY") ? host : null;
+    } catch {
+      return null;
+    }
   }
+}
+
+async function probeList(hosts, batchSize) {
+  for (let i = 0; i < hosts.length; i += batchSize) {
+    const slice = hosts.slice(i, i + batchSize);
+    const results = await Promise.all(slice.map(probe));
+    const hit = results.find(Boolean);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 // This machine's own IPv4 addresses, for the footer.
@@ -114,6 +132,9 @@ ipcMain.handle("push-firmware", async (_evt, host) => {
 
 // Scan the local /24 for the display.
 ipcMain.handle("find-display", async () => {
+  const hostnameHit = await probe(DEVICE_NAME);
+  if (hostnameHit) return hostnameHit;
+
   const nets = os.networkInterfaces();
   const bases = new Set();
   for (const name of Object.keys(nets)) {
@@ -123,14 +144,11 @@ ipcMain.handle("find-display", async () => {
       }
     }
   }
+  const hosts = [];
   for (const base of bases) {
-    const hosts = [];
     for (let i = 1; i < 255; i += 1) hosts.push(`${base}.${i}`);
-    const results = await Promise.all(hosts.map(probe));
-    const hit = results.find(Boolean);
-    if (hit) return hit;
   }
-  return null;
+  return probeList(hosts, 16);
 });
 
 app.whenReady().then(() => {

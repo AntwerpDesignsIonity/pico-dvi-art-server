@@ -1,6 +1,6 @@
 {
   "name": "ionity-note-app",
-  "version": "1.0.0",
+  "version": "4.0.0",
   "description": "Ionity Note - push notes to the scripture display",
   "main": "main.js",
   "author": "Ionity Global Pty Ltd",
