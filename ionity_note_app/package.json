@@ -26,7 +26,7 @@
     "nsis": { "artifactName": "IonityPicoNoteDisplay-${version}-setup.exe", "oneClick": true }
   },
   "devDependencies": {
-    "electron": "^33.0.0",
+    "electron": "^39.8.5",
     "electron-builder": "^25.1.8"
   }
 }
