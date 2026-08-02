@@ -437,6 +437,58 @@ static uint32_t ai_total_score(void) {
     return total;
 }
 
+// Bresenham line - unlocks 3D wireframe and vector work.
+static void draw_line(uint16_t *buf, int x0, int y0, int x1, int y1, uint16_t color) {
+    int dx = iabs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -iabs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        int e2;
+        if ((unsigned)x0 < FRAME_WIDTH && (unsigned)y0 < FRAME_HEIGHT) {
+            buf[y0 * FRAME_WIDTH + x0] = color;
+        }
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+// Impact screen shake: energy decays, each frame jitters the whole raster.
+static int shake_energy;
+
+static void add_shake(int amount) {
+    if (amount > shake_energy) shake_energy = amount;
+}
+
+static void apply_shake(uint16_t *buf, uint32_t frame) {
+    int dx;
+    if (shake_energy <= 0) return;
+    dx = (((int)hash8((uint16_t)frame, 5u, run_seed) & 7) - 3) * shake_energy / 5;
+    shake_energy -= 1;
+    if (dx == 0) return;
+    for (int y = 0; y < FRAME_HEIGHT; ++y) {
+        uint16_t *row = buf + y * FRAME_WIDTH;
+        if (dx > 0) {
+            memmove(row + dx, row, (size_t)(FRAME_WIDTH - dx) * 2u);
+            for (int i = 0; i < dx; ++i) row[i] = 0;
+        } else {
+            memmove(row, row - dx, (size_t)(FRAME_WIDTH + dx) * 2u);
+            for (int i = FRAME_WIDTH + dx; i < FRAME_WIDTH; ++i) row[i] = 0;
+        }
+    }
+}
+
+// Subtle CRT scanline pass: every third raster line at 75 percent.
+static void crt_pass(uint16_t *buf) {
+    for (int y = 2; y < FRAME_HEIGHT; y += 3) {
+        uint16_t *row = buf + y * FRAME_WIDTH;
+        for (int x = 0; x < FRAME_WIDTH; ++x) {
+            row[x] -= (uint16_t)((row[x] >> 2) & 0x39E7u);
+        }
+    }
+}
+
 static void draw_pyramid(uint16_t *buf, int cx, int base_y, int half_width, int height,
                          uint16_t color) {
     for (int row = 0; row < height; ++row) {
@@ -915,6 +967,7 @@ static void render_blocks(uint16_t *buf, const SceneDef *scene, uint32_t scene_f
                         blk_score += 100;
                         blk_lines += 1;
                         ai_award(MODE_BLOCKS, 100);
+                        add_shake(4);
                         spawn_burst(well_x + cols * cell / 2, well_y + r * cell + 6,
                                     20, block_c[theme], (uint16_t)scene_frame);
                         break;
@@ -1114,6 +1167,7 @@ static void render_shooter(uint16_t *buf, const SceneDef *scene, uint32_t scene_
                         RGB565(255, 190, 60), (uint16_t)(scene_frame + i * 51u));
             drone_down[i] = 36;
             ai_award(MODE_SHOOTER, 15);
+            add_shake(3);
         }
     }
 
@@ -1412,7 +1466,12 @@ static void render_racer(uint16_t *buf, const SceneDef *scene, uint32_t scene_fr
     };
     const int theme = scene->variant % 3;
     const int horizon = 86;
-    const int center = FRAME_WIDTH / 2 + (((int)wave8((uint16_t)(scene_frame * 2u + scene->variant * 20u)) - 128) >> 2);
+    // Long S-curves: track curvature evolves slowly, road bends quadratically
+    // with depth like a proper pseudo-3D racer.
+    const int curve = isin8((uint8_t)((scene_frame >> 2) + run_seed)) >> 4; // -8..8
+    const int center = FRAME_WIDTH / 2 - curve * 6;
+#define ROAD_CENTER_AT(yy) \
+    (center + (curve * ((yy) - horizon) * ((yy) - horizon)) / 900)
 
     fill_rect(buf, 0, 0, FRAME_WIDTH, horizon, sky_a[theme]);
     for (int y = 16; y < horizon; y += 8) {
@@ -1429,13 +1488,14 @@ static void render_racer(uint16_t *buf, const SceneDef *scene, uint32_t scene_fr
     for (int y = horizon; y < FRAME_HEIGHT; ++y) {
         int depth = y - horizon;
         int half = 24 + depth * 90 / (FRAME_HEIGHT - horizon);
-        int x0 = center - half;
+        int cx = ROAD_CENTER_AT(y);
+        int x0 = cx - half;
         int width = half * 2;
         fill_rect(buf, 0, y, x0, 1, side[theme]);
         fill_rect(buf, x0, y, width, 1, road[theme]);
         fill_rect(buf, x0 + width, y, FRAME_WIDTH - (x0 + width), 1, side[theme]);
         if (((depth + (int)(scene_frame * 4u)) % 26) < 12) {
-            fill_rect(buf, center - 2, y, 4, 1, lane[theme]);
+            fill_rect(buf, cx - 2, y, 4, 1, lane[theme]);
         }
     }
 
@@ -1458,7 +1518,7 @@ static void render_racer(uint16_t *buf, const SceneDef *scene, uint32_t scene_fr
         rival_pos[i] += (lane_target - rival_pos[i]) >> 4; // smooth lane change
         ry = horizon + 20 + (int)((scene_frame * 3u + i * 46u) % 108u);
         half = 24 + (ry - horizon) * 90 / (FRAME_HEIGHT - horizon);
-        draw_car(buf, center + ((rival_pos[i] * half) >> 9) - 8, ry, 2,
+        draw_car(buf, ROAD_CENTER_AT(ry) + ((rival_pos[i] * half) >> 9) - 8, ry, 2,
                  RGB565(78, 232, 248), RGB565(220, 246, 255), 0x0000);
     }
 
@@ -1473,12 +1533,13 @@ static void render_racer(uint16_t *buf, const SceneDef *scene, uint32_t scene_fr
         // Player drifts: chassis lags the road curve then counter-steers in.
         static int player_px;
         if (scene_frame == 0u) player_px = (FRAME_WIDTH / 2) << 8;
-        player_px += (((center - 12) << 8) - player_px) >> 3;
+        player_px += (((ROAD_CENTER_AT(184) - 12) << 8) - player_px) >> 3;
         if ((scene_frame % 4u) == 0u) {
             spawn_burst((player_px >> 8) + 6, 202, 1, RGB565(140, 140, 150), (uint16_t)scene_frame);
         }
         draw_car(buf, player_px >> 8, 184, 3, RGB565(255, 64, 72), RGB565(236, 250, 255), 0x0000);
     }
+#undef ROAD_CENTER_AT
 }
 
 static void render_space(uint16_t *buf, const SceneDef *scene, uint32_t scene_frame) {
@@ -1554,6 +1615,7 @@ static void render_space(uint16_t *buf, const SceneDef *scene, uint32_t scene_fr
                         RGB565(255, 170, 64), (uint16_t)(scene_frame + i * 37u));
             wasp_down[i] = 40 + i * 12;
             ai_award(MODE_SPACE, 25);
+            add_shake(3);
         }
     }
 
@@ -1680,6 +1742,7 @@ static void render_fighter(uint16_t *buf, const SceneDef *scene, uint32_t scene_
     const int theme = scene->variant % 3;
     const int floor_y = 190;
     static int fx[2], fvx[2], fhp[2], fstate[2], ftimer[2], rounds_won[2], ko_timer;
+    static int fb_x[2], fb_dir[2], fb_on[2], combo[2], combo_t[2];
     char hud[20];
 
     if (scene_frame == 0u) {
@@ -1691,6 +1754,9 @@ static void render_fighter(uint16_t *buf, const SceneDef *scene, uint32_t scene_
         rounds_won[0] = rounds_won[1] = 0;
         ko_timer = 0;
         fvx[0] = fvx[1] = 0;
+        fb_on[0] = fb_on[1] = 0;
+        combo[0] = combo[1] = 0;
+        combo_t[0] = combo_t[1] = 0;
     }
 
     if (ko_timer > 0) {
@@ -1700,6 +1766,8 @@ static void render_fighter(uint16_t *buf, const SceneDef *scene, uint32_t scene_
             fx[1] = (FRAME_WIDTH - 90) << 8;
             fhp[0] = fhp[1] = 96;
             fstate[0] = fstate[1] = 0;
+            fb_on[0] = fb_on[1] = 0;
+            combo[0] = combo[1] = 0;
         }
     } else {
         for (int i = 0; i < 2; ++i) {
@@ -1708,24 +1776,37 @@ static void render_fighter(uint16_t *buf, const SceneDef *scene, uint32_t scene_
             int dir = gap > 0 ? 1 : -1;
             uint8_t roll = hash8((uint16_t)(scene_frame + i * 97u), run_seed,
                                  (uint16_t)(fx[i] >> 10));
+            if (combo_t[i] > 0) combo_t[i] -= 1; else combo[i] = 0;
             if (ftimer[i] > 0) {
                 ftimer[i] -= 1;
                 if (fstate[i] == 1 && ftimer[i] == 4) {
-                    // Strike lands unless the other fighter is blocking.
-                    if (iabs(gap) < 34) {
+                    // Strike lands unless blocked or the target leapt clear.
+                    if (iabs(gap) < 34 && fstate[other] != 3) {
                         if (fstate[other] == 2) {
                             spawn_burst((fx[other] >> 8) + 8, floor_y - 30, 4,
                                         RGB565(200, 200, 220), (uint16_t)(scene_frame + i));
                         } else {
                             fhp[other] -= 8 + (roll & 7);
                             fvx[other] = dir * (3 << 8);
+                            combo[i] += 1;
+                            combo_t[i] = 40;
+                            add_shake(2 + combo[i]);
                             spawn_burst((fx[other] >> 8) + 8, floor_y - 34, 10,
                                         RGB565(255, 90, 60), (uint16_t)(scene_frame + i));
-                            ai_award(MODE_FIGHTER, 5);
+                            ai_award(MODE_FIGHTER, 5 * (combo[i] > 1 ? combo[i] : 1));
                         }
                     }
                 }
                 if (ftimer[i] == 0) fstate[i] = 0;
+            } else if (fb_on[other] &&
+                       iabs((fb_x[other] >> 8) - (fx[i] >> 8)) < 56 &&
+                       ((fb_dir[other] > 0) == ((fb_x[other] >> 8) < (fx[i] >> 8)))) {
+                fstate[i] = 3; // read the fireball, leap over it
+                ftimer[i] = 18;
+            } else if (iabs(gap) > 70 && !fb_on[i] && roll < 60) {
+                fb_on[i] = 1; // ranged opener
+                fb_dir[i] = dir;
+                fb_x[i] = fx[i] + dir * (18 << 8);
             } else if (iabs(gap) > 36) {
                 fx[i] += dir * (roll & 1 ? 2 : 1) << 8; // close in, uneven gait
                 if ((roll & 15) == 0) fx[i] -= dir << 8; // feint step back
@@ -1733,16 +1814,42 @@ static void render_fighter(uint16_t *buf, const SceneDef *scene, uint32_t scene_
                 if (roll < 100) { fstate[i] = 1; ftimer[i] = 10; }       // strike
                 else if (roll < 150) { fstate[i] = 2; ftimer[i] = 12; }  // block
                 else if (roll < 180) { fx[i] -= dir * (2 << 8); }        // retreat
+                else if (roll < 200) { fstate[i] = 3; ftimer[i] = 18; }  // leap
             }
             fx[i] += fvx[i];
             fvx[i] = (fvx[i] * 3) / 4; // knockback friction
             if (fx[i] < 20 << 8) fx[i] = 20 << 8;
             if (fx[i] > (FRAME_WIDTH - 44) << 8) fx[i] = (FRAME_WIDTH - 44) << 8;
         }
+        // Fireballs fly, connect or fizzle at the wall.
+        for (int i = 0; i < 2; ++i) {
+            int other = 1 - i;
+            if (!fb_on[i]) continue;
+            fb_x[i] += fb_dir[i] * (5 << 8);
+            if (iabs((fb_x[i] >> 8) - ((fx[other] >> 8) + 8)) < 12) {
+                if (fstate[other] == 3 && ftimer[other] > 4 && ftimer[other] < 15) {
+                    // dodged clean overhead
+                } else if (fstate[other] == 2) {
+                    fb_on[i] = 0;
+                    spawn_burst(fb_x[i] >> 8, floor_y - 30, 6,
+                                RGB565(160, 190, 255), (uint16_t)scene_frame);
+                } else {
+                    fb_on[i] = 0;
+                    fhp[other] -= 12;
+                    fvx[other] = fb_dir[i] * (4 << 8);
+                    add_shake(4);
+                    spawn_burst(fb_x[i] >> 8, floor_y - 30, 14,
+                                RGB565(120, 200, 255), (uint16_t)scene_frame);
+                    ai_award(MODE_FIGHTER, 8);
+                }
+            }
+            if ((fb_x[i] >> 8) < 4 || (fb_x[i] >> 8) > FRAME_WIDTH - 4) fb_on[i] = 0;
+        }
         for (int i = 0; i < 2; ++i) {
             if (fhp[i] <= 0) {
                 rounds_won[1 - i] += 1;
                 ko_timer = 50;
+                add_shake(9);
                 spawn_burst((fx[i] >> 8) + 8, floor_y - 28, 24,
                             i == 0 ? p1_c : p2_c, (uint16_t)scene_frame);
                 ai_award(MODE_FIGHTER, 50);
@@ -1769,18 +1876,41 @@ static void render_fighter(uint16_t *buf, const SceneDef *scene, uint32_t scene_
         int dir = ((fx[1 - i] >> 8) > x) ? 1 : -1;
         uint16_t body = i == 0 ? p1_c : p2_c;
         int crouch = fstate[i] == 2 ? 4 : 0;
+        int lift = 0;
+        if (fstate[i] == 3) {
+            int t = 18 - ftimer[i];
+            lift = (t * (18 - t)) / 3; // parabolic leap
+        }
         if (ko_timer > 0 && fhp[i] <= 0) {
             fill_rect(buf, x - 6, floor_y - 10, 26, 8, body); // down for the count
             continue;
         }
-        fill_rect(buf, x + 4, floor_y - 40 + crouch, 10, 10, RGB565(255, 214, 176));
-        fill_rect(buf, x + 2, floor_y - 30 + crouch, 14, 16, body);
-        fill_rect(buf, x + 2, floor_y - 14 + crouch, 5, 14 - crouch, body);
-        fill_rect(buf, x + 11, floor_y - 14 + crouch, 5, 14 - crouch, body);
+        fill_rect(buf, x + 4, floor_y - 40 + crouch - lift, 10, 10, RGB565(255, 214, 176));
+        fill_rect(buf, x + 2, floor_y - 30 + crouch - lift, 14, 16, body);
+        fill_rect(buf, x + 2, floor_y - 14 + crouch - lift, 5, 14 - crouch, body);
+        fill_rect(buf, x + 11, floor_y - 14 + crouch - lift, 5, 14 - crouch, body);
         if (fstate[i] == 1 && ftimer[i] > 3) {
             fill_rect(buf, x + (dir > 0 ? 16 : -12), floor_y - 28, 14, 5, body); // punch
         } else if (fstate[i] == 2) {
             fill_rect(buf, x + (dir > 0 ? 15 : -5), floor_y - 32, 4, 14, RGB565(220, 220, 240));
+        }
+        if (combo[i] > 1 && combo_t[i] > 0) {
+            char combo_text[14];
+            snprintf(combo_text, sizeof(combo_text), "%d HIT", combo[i]);
+            draw_text(buf, x - 4, floor_y - 58, combo_text, 1, body);
+        }
+    }
+
+    // Fireballs with crackling tails.
+    for (int i = 0; i < 2; ++i) {
+        int px;
+        if (!fb_on[i]) continue;
+        px = fb_x[i] >> 8;
+        fill_rect(buf, px - 3, floor_y - 33, 7, 7, RGB565(120, 200, 255));
+        fill_rect(buf, px - 2, floor_y - 32, 5, 5, 0xFFFF);
+        for (int t = 1; t <= 3; ++t) {
+            fill_rect(buf, px - fb_dir[i] * t * 5, floor_y - 31 + (t & 1), 3, 3,
+                      RGB565(60, 120, 220));
         }
     }
 
@@ -1794,6 +1924,9 @@ static void render_fighter(uint16_t *buf, const SceneDef *scene, uint32_t scene_
     draw_text(buf, (FRAME_WIDTH - (int)strlen(hud) * 6) / 2, 23, hud, 1, 0xFFFF);
     if (ko_timer > 20) {
         draw_text(buf, (FRAME_WIDTH - 2 * 12) / 2, 96, "KO", 4, RGB565(255, 60, 40));
+    }
+    if (scene_frame < 30u && ((scene_frame / 5u) & 1u) == 0u) {
+        draw_text(buf, (FRAME_WIDTH - 5 * 24) / 2, 90, "FIGHT", 4, RGB565(255, 214, 40));
     }
 }
 
@@ -1894,6 +2027,56 @@ static void render_art_break(uint16_t *buf, int scene_index, uint32_t art_frame)
         }
     }
 
+    // Spinning 3D wireframe cube, projected with integer math.
+    {
+        static const int8_t V[8][3] = {
+            {-1,-1,-1}, {1,-1,-1}, {1,1,-1}, {-1,1,-1},
+            {-1,-1,1}, {1,-1,1}, {1,1,1}, {-1,1,1},
+        };
+        static const uint8_t E[12][2] = {
+            {0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},
+            {0,4},{1,5},{2,6},{3,7},
+        };
+        int px[8], py[8];
+        int ca = icos8((uint8_t)(f * 2)), sa = isin8((uint8_t)(f * 2));
+        int cb = icos8((uint8_t)(f * 3 + 40)), sb = isin8((uint8_t)(f * 3 + 40));
+        int size = 40 + (isin8((uint8_t)f) >> 4);
+        int ccx = FRAME_WIDTH / 2, ccy = 96;
+        uint16_t edge_c = palette[(f / 32) & 3];
+        for (int i = 0; i < 8; ++i) {
+            int vx = V[i][0] * size, vy = V[i][1] * size, vz = V[i][2] * size;
+            int x1 = (vx * ca - vz * sa) >> 7;
+            int z1 = (vx * sa + vz * ca) >> 7;
+            int y2 = (vy * cb - z1 * sb) >> 7;
+            int z2 = (vy * sb + z1 * cb) >> 7;
+            px[i] = ccx + x1 * 130 / (z2 + 200);
+            py[i] = ccy + y2 * 130 / (z2 + 200);
+        }
+        for (int i = 0; i < 12; ++i) {
+            draw_line(buf, px[E[i][0]], py[E[i][0]], px[E[i][1]], py[E[i][1]], edge_c);
+        }
+        for (int i = 0; i < 8; ++i) {
+            fill_rect(buf, px[i] - 1, py[i] - 1, 3, 3, 0xFFFF);
+        }
+    }
+
+    // Demoscene sine scroller riding the lower band.
+    {
+        static const char SCROLL[] =
+            "IONITY DREAM ENGINE ... 8 BIT INFINITE ARCADE ... "
+            "THE AI NEVER PLAYS THE SAME GAME TWICE ... ";
+        int scroll_len = (int)sizeof(SCROLL) - 1;
+        int shift = (int)((art_frame * 3u) % (uint32_t)(scroll_len * 12));
+        for (int i = 0; i < scroll_len; ++i) {
+            int cx = i * 12 - shift;
+            int cy;
+            if (cx < -12) cx += scroll_len * 12;
+            if (cx < -12 || cx > FRAME_WIDTH) continue;
+            cy = 196 + (isin8((uint8_t)(cx * 2 + f * 6)) >> 4);
+            draw_char(buf, cx, cy, SCROLL[i], 2, 0xFFFF);
+        }
+    }
+
     fill_rect(buf, 0, 152, FRAME_WIDTH, 1, 0x0000);
     snprintf(caption, sizeof(caption), "NEXT: %s (%u)", next->title, (unsigned)next->year);
     fill_rect(buf, (FRAME_WIDTH - (int)strlen(caption) * 6) / 2 - 6, 162,
@@ -1926,6 +2109,7 @@ static void render_arcade_scene(uint16_t *buf, uint32_t global_frame) {
     if (in_break) {
         render_art_break(buf, scene_index, scene_frame);
         particles_step_draw(buf);
+        crt_pass(buf);
         draw_ui_bar(buf, scene_index, seconds_left);
         draw_clock_box(buf);
         draw_verse_ticker(buf, global_frame);
@@ -1967,6 +2151,8 @@ static void render_arcade_scene(uint16_t *buf, uint32_t global_frame) {
     }
 
     particles_step_draw(buf);
+    apply_shake(buf, global_frame);
+    crt_pass(buf);
     draw_ui_bar(buf, scene_index, seconds_left);
     draw_clock_box(buf);
     draw_verse_ticker(buf, global_frame);
