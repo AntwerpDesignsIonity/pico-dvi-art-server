@@ -28,3 +28,4 @@ Thumbs.db
 .DS_Store
 
 ionity_note_app/node_modules/
+ionity_note_app/dist/

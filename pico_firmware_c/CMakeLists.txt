@@ -89,7 +89,7 @@ if(NOT WIFI_SSID STREQUAL "")
         CYW43_PIO_CLOCK_DIV_INT=3
         CYW43_PIO_CLOCK_DIV_FRAC=0
     )
-    target_link_libraries(pico_dvi_art_client pico_cyw43_arch_lwip_poll)
+    target_link_libraries(pico_dvi_art_client pico_cyw43_arch_lwip_poll pico_lwip_mdns hardware_flash)
 endif()
 
 # Logs go to USB serial so a single cable does both power and diagnostics.

@@ -131,10 +131,12 @@
 
     <button class="send" id="send">Send to screen</button>
     <button class="clear" id="clearBtn">Clear the note</button>
+    <button class="clear" id="fwBtn">Update device firmware (OTA)</button>
     <div id="status"></div>
+    <div id="devinfo" style="margin-top:6px;font-size:10px;letter-spacing:1px;text-align:center;color:#5a6488;"></div>
   </div>
 
-  <div class="footer">Ionity Global Pty Ltd</div>
+  <div class="footer">Ionity Global Pty Ltd &nbsp;|&nbsp; This PC: <span id="myip">...</span></div>
 
   <script>
     const host = document.getElementById("host");
@@ -182,6 +184,7 @@
           host.value = found;
           localStorage.setItem("ionity-host", found);
           setStatus("DISPLAY FOUND AT " + found, "ok");
+          refreshDeviceInfo();
         } else {
           setStatus("NO DISPLAY FOUND ON THIS NETWORK", "err");
         }
@@ -190,6 +193,39 @@
       }
       scan.disabled = false;
     });
+
+    const fwBtn = document.getElementById("fwBtn");
+    const devinfo = document.getElementById("devinfo");
+
+    async function refreshDeviceInfo() {
+      const target = host.value.trim();
+      if (!target) return;
+      const info = await window.ionity.deviceInfo(target);
+      devinfo.textContent = info
+        ? `DEVICE V${info.version} - ${info.verses} VERSES - OTA ${info.ota ? "READY" : "NO"}`
+        : "DEVICE INFO UNAVAILABLE (V2 FIRMWARE HAS NO /id)";
+    }
+
+    fwBtn.addEventListener("click", async () => {
+      const target = host.value.trim();
+      if (!target) { setStatus("ENTER OR FIND THE DISPLAY ADDRESS", "err"); return; }
+      setStatus("PICK A .BIN, THEN UPLOADING (SCREEN GOES DARK)...");
+      fwBtn.disabled = true;
+      try {
+        const res = await window.ionity.pushFirmware(target);
+        if (res.status === "staged") setStatus("STAGED - DEVICE IS INSTALLING AND REBOOTING", "ok");
+        else if (res.status === "cancelled") setStatus("");
+        else setStatus("DEVICE REJECTED THE IMAGE: " + (res.body || ""), "err");
+      } catch (err) {
+        setStatus("UPLOAD FAILED - IS THIS A V3 (OTA) DEVICE?", "err");
+      }
+      fwBtn.disabled = false;
+    });
+
+    window.ionity.localIps().then((ips) => {
+      document.getElementById("myip").textContent = ips.length ? ips.join("  |  ") : "no network";
+    });
+    if (host.value) refreshDeviceInfo();
   </script>
 </body>
 </html>

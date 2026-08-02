@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Ionity Note - Ionity Global Pty Ltd</title>
+  <style>
+    :root {
+      --bg: #0a0c1a; --panel: #141830; --gold: #e0b254; --gold-dim: #8c6e34;
+      --ink: #ecf0f8; --muted: #aab4d2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background:
+        radial-gradient(1200px 500px at 20% -10%, #16204a 0%, transparent 60%),
+        radial-gradient(900px 500px at 110% 110%, #1a1436 0%, transparent 60%),
+        var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+      display: flex; flex-direction: column; align-items: center;
+      padding: 40px 20px;
+    }
+    .logo { width: 220px; filter: drop-shadow(0 4px 18px rgba(224,178,84,.25)); }
+    h1 { font-size: 26px; letter-spacing: 8px; color: var(--gold); margin: 22px 0 4px; text-transform: uppercase; font-weight: 600; }
+    .sub { font-size: 12px; letter-spacing: 3px; color: var(--muted); margin-bottom: 34px; text-transform: uppercase; }
+    .card {
+      width: 100%; max-width: 460px;
+      background: linear-gradient(180deg, rgba(224,178,84,.08), rgba(20,24,48,.9));
+      border: 1px solid var(--gold-dim); border-radius: 12px;
+      padding: 26px; margin-bottom: 20px;
+      box-shadow: 0 10px 40px rgba(0,0,0,.5);
+    }
+    h2 { font-size: 13px; letter-spacing: 3px; color: var(--gold); margin: 0 0 14px; text-transform: uppercase; }
+    p { font-size: 14px; line-height: 1.6; color: var(--muted); margin: 0 0 12px; }
+    a.button {
+      display: block; text-align: center; text-decoration: none;
+      background: linear-gradient(180deg, #f0c86e, var(--gold));
+      color: #1a1406; font-weight: 700; letter-spacing: 1px;
+      padding: 13px; border-radius: 8px; margin-top: 10px; text-transform: uppercase; font-size: 14px;
+    }
+    a.button.ghost { background: transparent; border: 1px solid var(--gold-dim); color: var(--gold); }
+    a.button:hover { filter: brightness(1.1); }
+    input {
+      width: 100%; background: #0d1024; border: 1px solid #2a3158; border-radius: 8px;
+      color: var(--ink); font-size: 16px; padding: 12px; outline: none;
+    }
+    input:focus { border-color: var(--gold); }
+    code { background: #0d1024; padding: 2px 6px; border-radius: 4px; color: var(--gold); }
+    .footer { margin-top: auto; padding-top: 30px; font-size: 11px; letter-spacing: 2px; color: #3c4468; text-transform: uppercase; }
+  </style>
+</head>
+<body>
+  <img class="logo" src="assets/ionity-global.png" alt="Ionity Global Pty Ltd">
+  <h1>Ionity Note</h1>
+  <div class="sub">Push a note to your scripture display</div>
+
+  <div class="card">
+    <h2>Open your display's note board</h2>
+    <p>The display serves its own note page on your Wi-Fi. If your network
+       supports mDNS, this link just works:</p>
+    <a class="button" href="http://ionity-scripture.local/">Open ionity-scripture.local</a>
+    <p style="margin-top:16px">Or enter the IP shown in the display's footer:</p>
+    <input id="ip" placeholder="e.g. 192.168.124.10" inputmode="decimal">
+    <a class="button ghost" id="go" href="#">Open note board</a>
+  </div>
+
+  <div class="card">
+    <h2>Desktop app &amp; tools</h2>
+    <p>The Windows app finds the display automatically, pushes notes and
+       installs firmware updates over Wi-Fi (OTA).</p>
+    <a class="button" href="https://github.com/Ionity-Global-Pty-Ltd/ionity-note/releases/latest">Download latest release</a>
+    <a class="button ghost" href="https://github.com/Ionity-Global-Pty-Ltd/ionity-note">View on GitHub</a>
+  </div>
+
+  <div class="card">
+    <h2>Command line</h2>
+    <p>Windows: <code>py -3 push_note.py &lt;ip&gt; "YOUR NOTE"</code><br>
+       Linux/macOS: <code>./ionity-note.sh &lt;ip&gt; "YOUR NOTE"</code></p>
+  </div>
+
+  <div class="footer">Ionity Global Pty Ltd</div>
+
+  <script>
+    const ip = document.getElementById("ip");
+    const go = document.getElementById("go");
+    ip.value = localStorage.getItem("ionity-ip") || "";
+    function openBoard() {
+      const v = ip.value.trim();
+      if (!v) return;
+      localStorage.setItem("ionity-ip", v);
+      window.location.href = "http://" + v + "/";
+    }
+    go.addEventListener("click", (e) => { e.preventDefault(); openBoard(); });
+    ip.addEventListener("keydown", (e) => { if (e.key === "Enter") openBoard(); });
+  </script>
+</body>
+</html>

@@ -35,6 +35,13 @@
 #define LWIP_NETIF_HOSTNAME         1
 #define LWIP_NETCONN_FULLDUPLEX     0
 
+// mDNS responder (device answers at ionity-scripture.local)
+#define LWIP_MDNS_RESPONDER         1
+#define LWIP_IGMP                   1
+#define LWIP_NUM_NETIF_CLIENT_DATA  1
+#define MEMP_NUM_UDP_PCB            5
+#define MDNS_RESP_USENETIF_EXTCALLBACK 1
+
 #define LWIP_STATS                  0
 #define LWIP_STATS_DISPLAY          0
 #define MEM_STATS                   0

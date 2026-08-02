@@ -6,9 +6,27 @@
   "author": "Ionity Global Pty Ltd",
   "license": "MIT",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "dist": "electron-builder --win portable nsis"
+  },
+  "build": {
+    "appId": "com.ionityglobal.note",
+    "productName": "Ionity Note",
+    "icon": "assets/ionity.ico",
+    "directories": { "output": "dist" },
+    "files": ["main.js", "preload.js", "index.html", "assets/**"],
+    "win": {
+      "target": [
+        { "target": "portable", "arch": ["x64"] },
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "assets/ionity.ico"
+    },
+    "portable": { "artifactName": "IonityNote-${version}-portable.exe" },
+    "nsis": { "artifactName": "IonityNote-${version}-setup.exe", "oneClick": true }
   },
   "devDependencies": {
-    "electron": "^33.0.0"
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
   }
 }
