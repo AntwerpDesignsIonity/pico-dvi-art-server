@@ -1,7 +1,7 @@
 {
-  "name": "ionity-note-app",
+  "name": "ionity-pico-note-display",
   "version": "4.0.0",
-  "description": "Ionity Note - push notes to the scripture display",
+  "description": "Ionity Pico Note-Display - push notes to the scripture display",
   "main": "main.js",
   "author": "Ionity Global Pty Ltd",
   "license": "MIT",
@@ -10,8 +10,8 @@
     "dist": "electron-builder --win portable nsis"
   },
   "build": {
-    "appId": "com.ionityglobal.note",
-    "productName": "Ionity Note",
+    "appId": "com.ionityglobal.piconotedisplay",
+    "productName": "Ionity Pico Note-Display",
     "icon": "assets/ionity.ico",
     "directories": { "output": "dist" },
     "files": ["main.js", "preload.js", "index.html", "assets/**"],
@@ -22,8 +22,8 @@
       ],
       "icon": "assets/ionity.ico"
     },
-    "portable": { "artifactName": "IonityNote-${version}-portable.exe" },
-    "nsis": { "artifactName": "IonityNote-${version}-setup.exe", "oneClick": true }
+    "portable": { "artifactName": "IonityPicoNoteDisplay-${version}-portable.exe" },
+    "nsis": { "artifactName": "IonityPicoNoteDisplay-${version}-setup.exe", "oneClick": true }
   },
   "devDependencies": {
     "electron": "^33.0.0",

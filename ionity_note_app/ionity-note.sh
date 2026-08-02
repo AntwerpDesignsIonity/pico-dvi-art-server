@@ -1,5 +1,5 @@
 #!/bin/sh
-# Ionity Note - push a note to the Ionity scripture display from any
+# Ionity Pico Note-Display - push a note to the Ionity scripture display from any
 # Linux/macOS shell. The display serves its note board on port 80.
 #
 # Usage:

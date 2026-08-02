@@ -1,4 +1,4 @@
-// Ionity Note - Electron shell. Pushes notes to the scripture display's
+// Ionity Pico Note-Display - Electron shell. Pushes notes to the scripture display's
 // note board (HTTP on port 80) and can scan the local subnet to find it.
 const { app, BrowserWindow, ipcMain, dialog } = require("electron");
 const fs = require("fs");
