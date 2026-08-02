@@ -71,6 +71,27 @@ target_link_libraries(pico_dvi_art_client
     libdvi
 )
 
+# Wi-Fi note board. Pass the credentials as build flags so they are never
+# committed: cmake -DWIFI_SSID="..." -DWIFI_PASSWORD="..." (or use
+# tools/build_firmware.py --wifi-ssid ... --wifi-pass ...). When a SSID is
+# set, the scripture firmware joins the network and serves a note page on
+# port 80 that any phone or PC browser can use.
+set(WIFI_SSID "" CACHE STRING "Wi-Fi SSID for the note server (empty = Wi-Fi off)")
+set(WIFI_PASSWORD "" CACHE STRING "Wi-Fi password for the note server")
+if(NOT WIFI_SSID STREQUAL "")
+    target_compile_definitions(pico_dvi_art_client PRIVATE
+        NOTE_WIFI_ENABLED=1
+        WIFI_SSID="${WIFI_SSID}"
+        WIFI_PASSWORD="${WIFI_PASSWORD}"
+        CYW43_HOST_NAME="ionity-scripture"
+        # The system clock runs at 252 MHz for DVI; slow the cyw43 PIO SPI
+        # divider down so the radio link stays within spec.
+        CYW43_PIO_CLOCK_DIV_INT=3
+        CYW43_PIO_CLOCK_DIV_FRAC=0
+    )
+    target_link_libraries(pico_dvi_art_client pico_cyw43_arch_lwip_poll)
+endif()
+
 # Logs go to USB serial so a single cable does both power and diagnostics.
 pico_enable_stdio_usb(pico_dvi_art_client 1)
 pico_enable_stdio_uart(pico_dvi_art_client 0)

@@ -24,6 +24,14 @@
 
 #include "verses.h"
 
+#ifndef NOTE_WIFI_ENABLED
+#define NOTE_WIFI_ENABLED 0
+#endif
+#if NOTE_WIFI_ENABLED
+#include "pico/cyw43_arch.h"
+#include "lwip/tcp.h"
+#endif
+
 #ifndef DIAG_SKIP_OVERCLOCK
 #define DIAG_SKIP_OVERCLOCK 0
 #endif
@@ -292,6 +300,162 @@ static DateTime current_clock(void) {
     return now;
 }
 
+// ---------------------------------------------------------------- note board
+// Anyone on the same Wi-Fi can push a note to the footer: the firmware joins
+// the network and serves a one-field web page on port 80. The note stays
+// until it is replaced (or cleared with an empty submit).
+#define NOTE_MAX 120
+static char note_text[NOTE_MAX + 1] = "";
+
+#if NOTE_WIFI_ENABLED
+
+static char net_ip[20] = "";
+static volatile int net_up = 0;
+static int net_started = 0;
+static struct tcp_pcb *note_listen_pcb;
+static char http_out[1400];
+
+static void note_set(const char *raw) {
+    int n = 0;
+    for (const char *p = raw; *p && n < NOTE_MAX; ++p) {
+        char c = *p;
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        if (c == '<' || c == '>' || c == '&' || c == '"' || c == '\'') continue;
+        if (c < 0x20 || c > 0x5F) continue;
+        if (c == ' ' && n == 0) continue;
+        note_text[n++] = c;
+    }
+    while (n > 0 && note_text[n - 1] == ' ') --n;
+    note_text[n] = '\0';
+}
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+// Decode an application/x-www-form-urlencoded value in place-ish.
+static void url_decode(const char *src, int src_len, char *dst, int dst_cap) {
+    int n = 0;
+    for (int i = 0; i < src_len && n < dst_cap - 1; ++i) {
+        char c = src[i];
+        if (c == '+') {
+            dst[n++] = ' ';
+        } else if (c == '%' && i + 2 < src_len) {
+            int hi = hexval(src[i + 1]);
+            int lo = hexval(src[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                dst[n++] = (char)((hi << 4) | lo);
+                i += 2;
+            }
+        } else {
+            dst[n++] = c;
+        }
+    }
+    dst[n] = '\0';
+}
+
+static err_t note_http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
+    (void)arg;
+    if (!p) {
+        tcp_close(pcb);
+        return ERR_OK;
+    }
+    if (err == ERR_OK && p->len > 4) {
+        char req[512];
+        int len = p->len < (int)sizeof(req) - 1 ? (int)p->len : (int)sizeof(req) - 1;
+        memcpy(req, p->payload, (size_t)len);
+        req[len] = '\0';
+
+        const char *q = strstr(req, "GET /note?t=");
+        if (q) {
+            const char *val = q + 12;
+            const char *end = val;
+            while (*end && *end != ' ' && *end != '&' && *end != '\r') ++end;
+            char decoded[NOTE_MAX * 3 + 1];
+            url_decode(val, (int)(end - val), decoded, (int)sizeof(decoded));
+            note_set(decoded);
+            printf("[note] set to \"%s\"\n", note_text);
+        }
+
+        int n = snprintf(http_out, sizeof(http_out),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+            "<!DOCTYPE html><html><head>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>IONITY NOTE</title><style>"
+            "body{font-family:monospace;background:#0a0c1a;color:#e0b254;"
+            "text-align:center;padding-top:8vh}"
+            "input{font-size:1.1em;padding:10px;width:82%%;max-width:420px;"
+            "background:#141830;color:#fff;border:1px solid #e0b254}"
+            "button{font-size:1.1em;padding:10px 28px;margin-top:14px;"
+            "background:#e0b254;color:#0a0c1a;border:0;font-weight:bold}"
+            "p{color:#aab4d2}</style></head><body>"
+            "<h2>IONITY SCRIPTURE<br>NOTE BOARD</h2>"
+            "<form action='/note'>"
+            "<input name='t' maxlength='%d' placeholder='Type a note for the screen...' autofocus>"
+            "<br><button>SEND TO SCREEN</button></form>"
+            "<p>ON SCREEN NOW:<br><b>%s</b></p>"
+            "<p>Submit an empty note to clear it.</p>"
+            "</body></html>",
+            NOTE_MAX, note_text[0] ? note_text : "(no note)");
+        tcp_write(pcb, http_out, (u16_t)n, TCP_WRITE_FLAG_COPY);
+        tcp_output(pcb);
+    }
+    tcp_recved(pcb, p->tot_len);
+    pbuf_free(p);
+    tcp_close(pcb);
+    return ERR_OK;
+}
+
+static err_t note_http_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
+    (void)arg;
+    if (err != ERR_OK || !newpcb) return ERR_VAL;
+    tcp_recv(newpcb, note_http_recv);
+    return ERR_OK;
+}
+
+static void note_server_start(void) {
+    struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
+    if (!pcb) return;
+    if (tcp_bind(pcb, IP_ANY_TYPE, 80) != ERR_OK) {
+        tcp_close(pcb);
+        return;
+    }
+    note_listen_pcb = tcp_listen_with_backlog(pcb, 2);
+    if (note_listen_pcb) tcp_accept(note_listen_pcb, note_http_accept);
+}
+
+// Called once per frame from the render loop; drives the Wi-Fi state.
+static void net_task(uint32_t frame) {
+    cyw43_arch_poll();
+    if ((frame % FPS_APPROX) != 0u) return; // status checks once a second
+
+    int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+    if (status == CYW43_LINK_UP) {
+        if (!net_up) {
+            const ip4_addr_t *addr = netif_ip4_addr(netif_default);
+            snprintf(net_ip, sizeof(net_ip), "%s", ip4addr_ntoa(addr));
+            net_up = 1;
+            printf("[note] wifi up, note board at http://%s/\n", net_ip);
+        }
+        if (!net_started) {
+            note_server_start();
+            net_started = 1;
+        }
+    } else if (status == CYW43_LINK_FAIL || status == CYW43_LINK_NONET ||
+               status == CYW43_LINK_BADAUTH) {
+        net_up = 0;
+        cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASSWORD,
+                                      CYW43_AUTH_WPA2_AES_PSK);
+    } else if (status == CYW43_LINK_DOWN) {
+        net_up = 0;
+    }
+}
+
+#endif // NOTE_WIFI_ENABLED
+
 // ---------------------------------------------------------------- verse flow
 // Verses appear in a randomized order at randomized intervals (12-30 s).
 static int cur_verse = 0;
@@ -509,17 +673,57 @@ static void render_scripture(uint16_t *buf, uint32_t frame) {
         fill_rect(buf, 6, FRAME_HEIGHT - 20, w, 2, gold);
     }
 
-    // ---- footer: IONITY mark + verse counter
+    // ---- footer: IONITY mark + note board + verse counter
     {
         const uint16_t blue = RGB565(36, 90, 200);
+        int count_w;
         fill_rect(buf, 0, FRAME_HEIGHT - 16, FRAME_WIDTH, 16, RGB565(4, 5, 12));
         fill_rect(buf, 4, FRAME_HEIGHT - 14, 48, 12, 0xFFFF);
         stroke_rect(buf, 4, FRAME_HEIGHT - 14, 48, 12, 1, blue);
         draw_text(buf, 8, FRAME_HEIGHT - 11, "IONITY", 1, blue);
         snprintf(info, sizeof(info), "VERSE %04u/%04u",
                  (unsigned)(cur_verse + 1), (unsigned)VERSE_DB_COUNT);
-        draw_text(buf, FRAME_WIDTH - 6 - (int)strlen(info) * 6, FRAME_HEIGHT - 11,
+        count_w = (int)strlen(info) * 6;
+        draw_text(buf, FRAME_WIDTH - 6 - count_w, FRAME_HEIGHT - 11,
                   info, 1, RGB565(170, 180, 210));
+
+        // note area between the mark and the counter
+        {
+            int area_x = 58;
+            int area_w = FRAME_WIDTH - 6 - count_w - 6 - area_x;
+            const char *msg = note_text;
+            char hint[40];
+#if NOTE_WIFI_ENABLED
+            if (!note_text[0]) {
+                if (net_up) {
+                    snprintf(hint, sizeof(hint), "NOTES: HTTP://%s", net_ip);
+                    msg = hint;
+                } else {
+                    msg = ((frame / 15u) & 1u) ? "WIFI JOINING." : "WIFI JOINING..";
+                }
+            }
+#else
+            (void)hint;
+#endif
+            if (msg[0]) {
+                int msg_len = (int)strlen(msg);
+                int msg_w = msg_len * 6;
+                if (msg_w <= area_w) {
+                    draw_text(buf, area_x + (area_w - msg_w) / 2, FRAME_HEIGHT - 11,
+                              msg, 1, gold);
+                } else {
+                    // marquee scroll for long notes
+                    int span = msg_w + 48;
+                    int off = (int)((frame / 2u) % (uint32_t)span);
+                    for (int c = 0; c < msg_len; ++c) {
+                        int px = area_x + area_w - off + c * 6;
+                        if (px >= area_x && px + 6 <= area_x + area_w) {
+                            draw_char(buf, px, FRAME_HEIGHT - 11, msg[c], 1, gold);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     verse_frame += 1;
@@ -596,12 +800,26 @@ int main(void) {
     multicore_launch_core1(core1_main);
 #endif
 
+#if NOTE_WIFI_ENABLED
+    if (cyw43_arch_init() == 0) {
+        cyw43_arch_enable_sta_mode();
+        cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASSWORD,
+                                      CYW43_AUTH_WPA2_AES_PSK);
+        printf("[boot] joining wifi \"%s\"\n", WIFI_SSID);
+    } else {
+        printf("[boot] cyw43 init failed - note board disabled\n");
+    }
+#endif
+
     watchdog_enable(WATCHDOG_TIMEOUT_MS, 1);
 
     {
         uint32_t frame = 0;
         absolute_time_t next_frame = get_absolute_time();
         for (;;) {
+#if NOTE_WIFI_ENABLED
+            net_task(frame);
+#endif
             uint8_t back = (uint8_t)(1u - front_idx);
             if (back != scanout_idx) {
                 render_scripture(framebuf[back], frame);

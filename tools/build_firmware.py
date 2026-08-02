@@ -162,7 +162,13 @@ def shell_through_vcvars(vcvars: str, command: list[str], cwd: Path) -> int:
     return subprocess.call(line, shell=True, cwd=cwd)
 
 
-def build(clean: bool = False, mode: str = "640x480", invert_diffpairs: int = 1) -> Path:
+def build(
+    clean: bool = False,
+    mode: str = "640x480",
+    invert_diffpairs: int = 1,
+    wifi_ssid: str = "",
+    wifi_pass: str = "",
+) -> Path:
     ensure_sources()
 
     cmake = find_cmake()
@@ -206,9 +212,9 @@ def build(clean: bool = False, mode: str = "640x480", invert_diffpairs: int = 1)
 
     wide = "ON" if mode == "800x480" else "OFF"
     stamp = BUILD_DIR / "dvi_mode.stamp"
-    stamp_value = f"{mode}|invert={invert_diffpairs}"
+    stamp_value = f"{mode}|invert={invert_diffpairs}|wifi={wifi_ssid}|{hash(wifi_pass) & 0xFFFF:04x}"
     if stamp.exists() and stamp.read_text(encoding="utf-8").strip() != stamp_value:
-        log(f"panel mode/polarity changed to {stamp_value} - reconfiguring")
+        log(f"panel mode/polarity/wifi changed - reconfiguring")
         (BUILD_DIR / "build.ninja").unlink(missing_ok=True)
 
     if not (BUILD_DIR / "build.ninja").exists():
@@ -226,6 +232,8 @@ def build(clean: bool = False, mode: str = "640x480", invert_diffpairs: int = 1)
             f"-DPICODVI_PATH={PICODVI_DIR.as_posix()}",
             f"-DDVI_MODE_800X480={wide}",
             f"-DDVI_INVERT_DIFFPAIRS={invert_diffpairs}",
+            f"-DWIFI_SSID={wifi_ssid}",
+            f"-DWIFI_PASSWORD={wifi_pass}",
         ]
         rc = (
             shell_through_vcvars(vcvars, configure, FIRMWARE_DIR)
@@ -300,12 +308,20 @@ def main(argv=None) -> int:
         choices=[0, 1],
         help="TMDS diff-pair polarity (1 matches this carrier; try 0 only if the panel never locks)",
     )
+    parser.add_argument("--wifi-ssid", default="", help="Wi-Fi SSID for the note server (empty = Wi-Fi off)")
+    parser.add_argument("--wifi-pass", default="", help="Wi-Fi password for the note server")
     args = parser.parse_args(argv)
 
     uf2 = (
         BUILD_DIR / UF2_NAME
         if args.no_build
-        else build(clean=args.clean, mode=args.mode, invert_diffpairs=args.invert_diffpairs)
+        else build(
+            clean=args.clean,
+            mode=args.mode,
+            invert_diffpairs=args.invert_diffpairs,
+            wifi_ssid=args.wifi_ssid,
+            wifi_pass=args.wifi_pass,
+        )
     )
     if args.no_build and not uf2.exists():
         raise SystemExit(f"{uf2} does not exist yet - run without --no-build first")

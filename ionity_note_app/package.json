@@ -1,0 +1,14 @@
+{
+  "name": "ionity-note-app",
+  "version": "1.0.0",
+  "description": "Ionity Note - push notes to the scripture display",
+  "main": "main.js",
+  "author": "Ionity Global Pty Ltd",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}
