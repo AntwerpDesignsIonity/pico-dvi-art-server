@@ -4,33 +4,22 @@ __pycache__/
 .venv/
 venv/
 
-# Server runtime artefacts
-pc_server/config.json
-pc_server/ota.trigger
-pc_server/art_cache/
-preview/
-received.png
-
-# Downloaded MicroPython .uf2 images (tools/flash_pico.py)
+# Local desktop settings
+app/settings.json
 .cache/
 
-# Device credentials - MUST NEVER BE COMMITTED (the repo is public for raw OTA)
+# Legacy local files that may still exist on upgraded worktrees
+pc_server/config.json
 pico_firmware/device_secrets.py
 pico_firmware_c/wifi_config.h
 
-# C firmware build trees (CMake/Ninja output, hundreds of MB of objects)
+# C firmware build trees
 pico_firmware_c/build/
 pico_firmware_c/build-*/
 
-# Packaged standalone desktop app build scratch files. The release executable
-# itself is intentionally committed so users can run the appliance directly.
+# Packaged desktop app build scratch files
 build_exe_tmp/
 PicoDVIArtStudio_debug.exe
-
-# Pico OTA leftovers (only ever exist on the device, never in the repo)
-*.bak
-*.new
-ota.pending
 
 # Editors / OS
 .vscode/

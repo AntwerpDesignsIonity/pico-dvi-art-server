@@ -1,21 +1,18 @@
 @echo off
 setlocal EnableDelayedExpansion
-title Pico DVI Art Studio - Antwerp Ionity
+title Pico DVI Firmware Studio - Antwerp Ionity
 cd /d "%~dp0"
 
 REM ===================================================================
-REM  START.bat - the ONLY file you run. No questions, no options.
+REM  START.bat - source launcher for the Pico-only firmware workspace.
 REM
-REM  It finds Python, installs what it needs, provisions any Pico that
-REM  is (or later gets) plugged in, and opens preview/device controls.
-REM  Art renders on the Pico and continues when this app is closed.
-REM
-REM  Stop it by closing the window.
+REM  It finds Python, installs the small desktop dependency set the first
+REM  time, and opens the native firmware build/flash tool.
 REM ===================================================================
 
 echo.
 echo   ==================================================================
-echo      PICO DVI ART STUDIO - starting up
+echo      PICO DVI FIRMWARE STUDIO - starting up
 echo   ==================================================================
 echo.
 
@@ -53,11 +50,11 @@ if not defined PYEXE (
 )
 echo   [1/3] Python  : %PYEXE% %PYARG%
 
-REM ---- 2. dependencies ------------------------------------------------
-"%PYEXE%" %PYARG% -c "import numpy, serial, mpremote" >nul 2>&1
+REM ---- 2. dependencies -----------------------------------------------
+"%PYEXE%" %PYARG% -c "import serial" >nul 2>&1
 if errorlevel 1 (
     echo   [2/3] Installing dependencies, this happens once...
-    "%PYEXE%" %PYARG% -m pip install -q --disable-pip-version-check -r pc_server\requirements.txt mpremote pyserial
+    "%PYEXE%" %PYARG% -m pip install -q --disable-pip-version-check pyserial
     if errorlevel 1 (
         echo   [X] Dependency install failed. Check your internet connection.
         pause
@@ -67,12 +64,8 @@ if errorlevel 1 (
     echo   [2/3] Dependencies: ok
 )
 
-REM ---- 3. launch the desktop app ---------------------------------------
-REM  app\studio.py is a native Tkinter application. It runs the control server
-REM  in-process, exposes preview settings, shows a desktop preview and can
-REM  build/flash/OTA the Pico - so there is nothing else to start and no
-REM  port or path for anyone to type in.
-echo   [3/3] Opening Pico DVI Art Studio
+REM ---- 3. launch the desktop app -------------------------------------
+echo   [3/3] Opening Pico DVI Firmware Studio
 echo.
 
 :RUN

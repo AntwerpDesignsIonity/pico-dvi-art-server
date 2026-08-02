@@ -1,65 +1,40 @@
-"""Pico DVI Art Studio - the desktop application that runs the whole appliance.
+"""Native Pico-only desktop launcher for firmware build and flashing.
 
-This is a native desktop app (Tkinter), not a web page: no browser, no npm, no
-Electron download, no dev server. Tkinter ships with Python, so START.bat can
-launch it on a clean machine with nothing but the repo checked out.
-
-It owns everything the appliance needs:
-
-  * the preview/control server, running in-process on a background thread - there is no
-    separate console to babysit and no port for anyone to type in,
-  * every setting in pc_server/config.py, grouped and validated,
-  * a desktop preview of the art style generated locally by the Pico,
-  * device control: build firmware, flash it, push an OTA update.
-
-Nothing here asks the user to pick a port, an IP or a file path.
+The repository no longer ships a PC preview or control server. This app keeps
+the local display build settings, shows USB/BOOTSEL state, and shells out to
+tools/build_firmware.py for the actual work.
 """
 
 from __future__ import annotations
 
-import ast
 import ctypes
-import io
-import json
 import queue
-import re
 import shutil
-import socket
 import subprocess
 import sys
 import threading
-import time
 import tkinter as tk
-from dataclasses import fields
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-from serial.tools import list_ports
+from studio_settings import DVI_MODES, StudioSettings, load_settings, save_settings
 
 REPO = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent.parent
 )
-sys.path.insert(0, str(REPO / "pc_server"))
+sys.path.insert(0, str(REPO / "tools"))
 
-import numpy as np  # noqa: E402
+from pico_device import describe_connected_device  # noqa: E402
 
-from config import DVI_MODES, Config  # noqa: E402
-from server import ArtServer, local_addresses  # noqa: E402
+POLL_MS = 150
+DEVICE_REFRESH_MS = 1000
+UF2_PATH = REPO / "pico_firmware_c" / "build" / "pico_dvi_art_client.uf2"
+_INSTANCE_MUTEX = None
 
 
 def _find_system_python() -> str | None:
-    """Locate a real python.exe to run tools/*.py subprocesses.
-
-    When this app is itself a frozen .exe, sys.executable is that .exe, not
-    a Python interpreter - passing it as an argv[0] for build_firmware.py
-    would just relaunch the GUI. The firmware build/flash tools need CMake,
-    Ninja and the Pico SDK anyway, so they are only ever run on a dev
-    machine that has Python installed regardless of how this app was
-    started. Resolved lazily (not at import time) so a frozen build with no
-    system Python installed can still control the device - only Build/OTA need it.
-    """
     if not getattr(sys, "frozen", False):
         return sys.executable
     for candidate in ("py", "python"):
@@ -69,782 +44,325 @@ def _find_system_python() -> str | None:
     return None
 
 
-PYTHON = sys.executable if not getattr(sys, "frozen", False) else None
-POLL_MS = 120
-PREVIEW_ZOOM = 2
-RASPBERRY_PI_VID = 0x2E8A
-DEVICE_SECRETS = REPO / "pico_firmware" / "device_secrets.py"
-SAFE_UF2 = REPO / "pico_firmware_c" / "build" / "pico_dvi_art_client.uf2"
-MODE_STAMP = REPO / "pico_firmware_c" / "build" / "dvi_mode.stamp"
-FIREWALL_RULE_NAME = "Pico DVI Art Server"
-_INSTANCE_MUTEX = None
-
-
-def _firewall_rule_exists(port: int) -> bool:
-    """Query Windows Firewall for our inbound rule. Never needs admin rights."""
-    if sys.platform != "win32":
-        return True
-    try:
-        result = subprocess.run(
-            [
-                "netsh", "advfirewall", "firewall", "show", "rule",
-                f"name={FIREWALL_RULE_NAME}",
-            ],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0 and str(port) in result.stdout
-
-
-def ensure_firewall_rule(port: int, log) -> None:
-    """Open the TCP port inbound so the Pico's Wi-Fi connection is not
-    silently dropped when Windows classifies the LAN as a Public network.
-
-    Adding a firewall rule always requires admin rights. We try the direct
-    (non-elevated) command first - it succeeds when the app is already run
-    as admin - and only fall back to a one-time UAC prompt otherwise.
-    """
-    if sys.platform != "win32":
-        return
-    if _firewall_rule_exists(port):
-        log(f"[firewall] inbound rule for port {port} already present")
-        return
-
-    add_args = (
-        "advfirewall firewall add rule "
-        f'name="{FIREWALL_RULE_NAME}" dir=in action=allow protocol=TCP '
-        f"localport={port} profile=any"
-    )
-    try:
-        direct = subprocess.run(
-            ["netsh"] + add_args.split(), capture_output=True, text=True, timeout=10
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        direct = None
-        log(f"[firewall] could not run netsh directly: {exc}")
-
-    if direct is not None and direct.returncode == 0:
-        log(f"[firewall] opened inbound TCP {port} for Pico control")
-        return
-
-    log(
-        f"[firewall] requesting one-time admin approval to open TCP {port} "
-        "(Windows will show a Yes/No prompt)"
-    )
-    try:
-        rc = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", "netsh", add_args, None, 0
-        )
-    except OSError as exc:
-        log(f"[firewall] elevation failed: {exc}")
-        return
-    # ShellExecuteW returns a value > 32 on success at launch time; the
-    # actual netsh run happens asynchronously once the user approves.
-    if rc <= 32:
-        log(
-            "[firewall] elevation prompt did not launch - open the port "
-            "manually or run studio.py as Administrator"
-        )
-        return
-
-    for _ in range(20):  # give the user a few seconds to click "Yes"
-        time.sleep(0.5)
-        if _firewall_rule_exists(port):
-            log(f"[firewall] opened inbound TCP {port} for Pico control")
-            return
-    log(
-        f"[firewall] rule for port {port} still missing - approve the UAC "
-        "prompt, or add it manually if it was dismissed"
-    )
-
-# (field name, label, widget kind, options)
-SETTING_GROUPS: list[tuple[str, list[tuple[str, str, str, object]]]] = [
-    ("Display", [
-        ("dvi_mode", "Panel mode", "choice", sorted(DVI_MODES)),
-        ("dvi_invert_diffpairs", "TMDS polarity (0 normal, 1 inverted)", "choice", [0, 1]),
-        ("fps", "Preview frames/second", "float", None),
-    ]),
-    ("Desktop preview", [
-        ("source", "Art source", "choice", ["shader", "retro", "ai", "hybrid"]),
-        ("speed", "Animation speed", "float", None),
-        ("seed", "Seed (blank = random)", "text", None),
-        ("border_thickness", "Border thickness (px)", "int", None),
-        ("border_intensity", "Border intensity", "float", None),
-    ]),
-    ("Clock / HUD", [
-        ("hud", "Show HUD", "bool", None),
-        ("clock_24h", "24-hour clock", "bool", None),
-        ("show_seconds", "Show seconds", "bool", None),
-        ("date_format", "Date format", "text", None),
-        ("timezone", "Timezone (blank = local)", "text", None),
-        ("hud_margin", "HUD margin (px)", "int", None),
-        ("hud_scale_clock", "Clock scale", "int", None),
-        ("hud_scale_small", "Label scale", "int", None),
-    ]),
-    ("Temperature", [
-        ("temp_source", "Source", "choice", ["weather", "cpu", "static", "none"]),
-        ("temp_static_c", "Static value (C)", "float", None),
-        ("latitude", "Latitude", "float", None),
-        ("longitude", "Longitude", "float", None),
-        ("temp_refresh_s", "Refresh (s)", "float", None),
-        ("temp_label_server", "Server label", "text", None),
-        ("temp_label_local", "Device label", "text", None),
-    ]),
-    ("AI preview", [
-        ("ai_enabled", "Enable AI source", "bool", None),
-        ("ai_provider", "Provider", "choice", ["openai", "folder"]),
-        ("ai_model", "Model", "text", None),
-        ("ai_size", "Requested size", "text", None),
-        ("ai_interval_s", "New image every (s)", "float", None),
-        ("ai_fade_s", "Cross-fade (s)", "float", None),
-        ("ai_folder", "Local folder", "text", None),
-        ("ai_api_key_env", "API key env var", "text", None),
-    ]),
-    ("Network", [
-        ("wifi_ssid", "Wi-Fi SSID", "text", None),
-        ("wifi_pass", "Wi-Fi password", "password", None),
-        ("host", "Listen address", "text", None),
-        ("port", "Port", "int", None),
-    ]),
-]
-
-
-class LogTee(io.TextIOBase):
-    """Mirror everything the server prints into the GUI log pane."""
-
-    def __init__(self, sink: queue.Queue, passthrough) -> None:
-        self.sink = sink
-        self.passthrough = passthrough
-
-    def write(self, text: str) -> int:
-        if text:
-            self.sink.put(text)
-            if self.passthrough is not None:
-                try:
-                    self.passthrough.write(text)
-                except (ValueError, OSError):
-                    pass
-        return len(text)
-
-    def flush(self) -> None:
-        if self.passthrough is not None:
-            try:
-                self.passthrough.flush()
-            except (ValueError, OSError):
-                pass
-
-
-class UsbDeviceMonitor:
-    """Detect Raspberry Pi USB only for explicit firmware flashing."""
-
-    def __init__(self, studio: "Studio") -> None:
-        self.studio = studio
-        self.stop_event = threading.Event()
-        self.pause_event = threading.Event()
-        self.port: str | None = None
-        self.connected = False
-        self.error = ""
-        self.thread = threading.Thread(
-            target=self._run, name="usb-device-monitor", daemon=True
-        )
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        self.thread.join(timeout=3)
-
-    def pause(self) -> None:
-        self.pause_event.set()
-        deadline = time.monotonic() + 4
-        while self.connected and time.monotonic() < deadline:
-            time.sleep(0.05)
-
-    def resume(self) -> None:
-        self.pause_event.clear()
-
-    @staticmethod
-    def _pico_port() -> str | None:
-        return next(
-            (
-                info.device
-                for info in list_ports.comports()
-                if info.vid == RASPBERRY_PI_VID
-            ),
-            None,
-        )
-
-    @staticmethod
-    def _bootsel_drive() -> Path | None:
-        if sys.platform != "win32":
-            return None
-        for letter in range(ord("D"), ord("Z") + 1):
-            drive = Path(f"{chr(letter)}:\\")
-            info = drive / "INFO_UF2.TXT"
-            try:
-                text = info.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            if "RP2350" in text:
-                return drive
-        return None
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            if self.pause_event.is_set():
-                self.connected = False
-                self.stop_event.wait(0.1)
-                continue
-            bootsel = self._bootsel_drive()
-            if bootsel is not None:
-                self._recover_bootsel(bootsel)
-                self.stop_event.wait(3)
-                continue
-
-            port = self._pico_port()
-            if port is None:
-                self.port = None
-                self.connected = False
-                self.stop_event.wait(1)
-                continue
-
-            first_seen = not self.connected or self.port != port
-            self.port = port
-            self.connected = True
-            self.error = ""
-            if first_seen:
-                self.studio.log(
-                    f"[usb] Pico detected on {port} for firmware flashing only"
-                )
-            self.stop_event.wait(1)
-
-    def _recover_bootsel(self, drive: Path) -> None:
-        self.port = f"RP2350 BOOTSEL {drive}"
-        self.connected = True
-        try:
-            mode = MODE_STAMP.read_text(encoding="utf-8").strip()
-        except OSError:
-            mode = ""
-        polarity = self.studio.cfg.dvi_invert_diffpairs
-        if mode != f"640x480|invert={polarity}" or not SAFE_UF2.exists():
-            self.studio.log("[usb] building safe 640x480 recovery firmware")
-            result = subprocess.run(
-                [
-                    PYTHON,
-                    str(REPO / "tools" / "build_firmware.py"),
-                    "--mode",
-                    "640x480",
-                    "--invert-diffpairs",
-                    str(polarity),
-                ],
-                cwd=str(REPO),
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                self.error = result.stdout or result.stderr or "recovery build failed"
-                self.studio.log(f"[usb] recovery build failed: {self.error}")
-                return
-        self.studio.log(f"[usb] RP2350 BOOTSEL detected at {drive}; flashing safe firmware")
-        try:
-            shutil.copy2(SAFE_UF2, drive / SAFE_UF2.name)
-        except OSError as exc:
-            self.error = str(exc)
-            self.studio.log(f"[usb] recovery flash failed: {exc}")
-            return
-        self.studio.log("[usb] safe firmware copied; waiting for Pico reboot")
-
 class Studio(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Pico DVI Art Studio")
-        self.geometry("1180x780")
-        self.minsize(980, 640)
+        self.title("Pico DVI Firmware Studio")
+        self.geometry("1080x720")
+        self.minsize(920, 620)
 
-        self.cfg = Config.load()
-        self.server: ArtServer | None = None
-        self.server_thread: threading.Thread | None = None
-        self.logq: queue.Queue = queue.Queue()
+        try:
+            self.settings = load_settings()
+        except (OSError, ValueError) as exc:
+            messagebox.showwarning(
+                "Settings reset",
+                f"Stored settings could not be loaded and were reset.\n\n{exc}",
+            )
+            self.settings = StudioSettings()
+
+        self.logq = queue.Queue()
         self.vars: dict[str, tk.Variable] = {}
-        self._preview_img: tk.PhotoImage | None = None
         self._busy = False
-        self.usb = UsbDeviceMonitor(self)
-
-        sys.stdout = LogTee(self.logq, sys.__stdout__)
-        sys.stderr = LogTee(self.logq, sys.__stderr__)
 
         self._build_ui()
         self._load_into_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(POLL_MS, self._tick)
-        self.log(f"Ready. Repo: {REPO}")
-        self.start_server()
-        self.usb.start()
+        self.after(0, self._refresh_device_status)
+        self.log("Ready. This workspace now builds and flashes Pico firmware only.")
 
-    # -- construction ----------------------------------------------------
     def _build_ui(self) -> None:
         bar = ttk.Frame(self, padding=(10, 8))
         bar.pack(side="top", fill="x")
 
-        self.btn_server = ttk.Button(
-            bar, text="Stop control server", command=self.toggle_server
+        self.btn_save = ttk.Button(bar, text="Save settings", command=self.save_form_settings)
+        self.btn_save.pack(side="left")
+        self.btn_build = ttk.Button(bar, text="Build firmware", command=self.build_firmware)
+        self.btn_build.pack(side="left", padx=(8, 0))
+        self.btn_flash = ttk.Button(bar, text="Flash existing UF2", command=self.flash_existing)
+        self.btn_flash.pack(side="left", padx=(8, 0))
+        self.btn_build_flash = ttk.Button(
+            bar,
+            text="Build + flash",
+            command=self.build_and_flash,
         )
-        self.btn_server.pack(side="left")
-        ttk.Button(bar, text="Save settings", command=self.save_settings).pack(
-            side="left", padx=(8, 0)
-        )
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        self.btn_build = ttk.Button(
-            bar, text="Build + flash firmware", command=self.build_and_flash
-        )
-        self.btn_build.pack(side="left")
-        self.btn_ota = ttk.Button(bar, text="Push OTA", command=self.push_ota)
-        self.btn_ota.pack(side="left", padx=(8, 0))
+        self.btn_build_flash.pack(side="left", padx=(8, 0))
 
-        self.status = ttk.Label(bar, text="", anchor="e")
+        self.status = ttk.Label(bar, text="Idle", anchor="e")
         self.status.pack(side="right", fill="x", expand=True)
 
-        body = ttk.PanedWindow(self, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        body = ttk.Frame(self, padding=(10, 0, 10, 10))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=5)
+        body.rowconfigure(0, weight=1)
 
-        book = ttk.Notebook(body)
-        for title, spec in SETTING_GROUPS:
-            book.add(self._settings_page(book, spec), text=title)
-        body.add(book, weight=3)
-
+        left = ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         right = ttk.Frame(body)
-        body.add(right, weight=4)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(2, weight=1)
 
-        pv = ttk.LabelFrame(right, text="Live preview - exactly what the panel receives")
-        pv.pack(fill="x")
-        self.preview = tk.Label(pv, background="#0b0b0f")
-        self.preview.pack(padx=8, pady=8)
+        config_box = ttk.LabelFrame(left, text="Firmware configuration", padding=12)
+        config_box.pack(fill="x")
+        config_box.columnconfigure(1, weight=1)
 
-        dev = ttk.LabelFrame(right, text="Device")
-        dev.pack(fill="x", pady=(10, 0))
-        self.device_label = ttk.Label(dev, text="waiting...", justify="left")
-        self.device_label.pack(anchor="w", padx=8, pady=8)
+        ttk.Label(config_box, text="Panel mode").grid(row=0, column=0, sticky="w", pady=4)
+        mode_var = tk.StringVar()
+        ttk.Combobox(
+            config_box,
+            textvariable=mode_var,
+            values=list(DVI_MODES),
+            state="readonly",
+        ).grid(row=0, column=1, sticky="ew", pady=4)
+        self.vars["dvi_mode"] = mode_var
 
-        logf = ttk.LabelFrame(right, text="Log")
-        logf.pack(fill="both", expand=True, pady=(10, 0))
+        ttk.Label(config_box, text="TMDS polarity").grid(row=1, column=0, sticky="w", pady=4)
+        polarity_var = tk.StringVar()
+        ttk.Combobox(
+            config_box,
+            textvariable=polarity_var,
+            values=["1", "0"],
+            state="readonly",
+        ).grid(row=1, column=1, sticky="ew", pady=4)
+        self.vars["dvi_invert_diffpairs"] = polarity_var
+
+        help_box = ttk.LabelFrame(left, text="Purpose", padding=12)
+        help_box.pack(fill="x", pady=(10, 0))
+        ttk.Label(
+            help_box,
+            text=(
+                "This repository is now Pico-only.\n\n"
+                "The Pico renders the art locally in C. The desktop side is used only "
+                "to build the UF2 and flash it over USB. There is no control server, "
+                "desktop preview, or runtime network dependency."
+            ),
+            justify="left",
+            wraplength=300,
+        ).pack(anchor="w")
+
+        workflow_box = ttk.LabelFrame(left, text="Workflow", padding=12)
+        workflow_box.pack(fill="x", pady=(10, 0))
+        ttk.Label(
+            workflow_box,
+            text=(
+                "1. Connect the Pico by USB.\n"
+                "2. Keep 640x480 / polarity 1 as the safe default.\n"
+                "3. Click Build + flash.\n"
+                "4. If auto-reboot into BOOTSEL fails, reconnect while holding BOOTSEL."
+            ),
+            justify="left",
+            wraplength=300,
+        ).pack(anchor="w")
+
+        device_box = ttk.LabelFrame(right, text="Connected device", padding=12)
+        device_box.grid(row=0, column=0, sticky="ew")
+        self.device_label = ttk.Label(device_box, text="Detecting device...", justify="left")
+        self.device_label.pack(anchor="w")
+
+        artifact_box = ttk.LabelFrame(right, text="Firmware artifact", padding=12)
+        artifact_box.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            artifact_box,
+            text=f"UF2 path: {UF2_PATH}",
+            justify="left",
+            wraplength=620,
+        ).pack(anchor="w")
+
+        log_box = ttk.LabelFrame(right, text="Build log", padding=8)
+        log_box.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        log_box.rowconfigure(0, weight=1)
+        log_box.columnconfigure(0, weight=1)
         self.logbox = tk.Text(
-            logf, height=10, wrap="none", background="#11131a",
-            foreground="#c8d0e0", insertbackground="#c8d0e0", relief="flat",
+            log_box,
+            wrap="none",
+            background="#11131a",
+            foreground="#c8d0e0",
+            insertbackground="#c8d0e0",
+            relief="flat",
         )
-        self.logbox.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
-        sb = ttk.Scrollbar(logf, orient="vertical", command=self.logbox.yview)
-        sb.pack(side="right", fill="y", pady=8, padx=(0, 8))
-        self.logbox.configure(yscrollcommand=sb.set, state="disabled")
+        self.logbox.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(log_box, orient="vertical", command=self.logbox.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.logbox.configure(yscrollcommand=scroll.set, state="disabled")
 
-    def _settings_page(self, parent, spec) -> ttk.Frame:
-        page = ttk.Frame(parent, padding=12)
-        page.columnconfigure(1, weight=1)
-        for row, (name, label, kind, options) in enumerate(spec):
-            ttk.Label(page, text=label).grid(
-                row=row, column=0, sticky="w", pady=4, padx=(0, 10)
-            )
-            if kind == "bool":
-                var: tk.Variable = tk.BooleanVar()
-                ttk.Checkbutton(page, variable=var).grid(row=row, column=1, sticky="w")
-            elif kind == "choice":
-                var = tk.StringVar()
-                ttk.Combobox(
-                    page, textvariable=var, values=list(options), state="readonly"
-                ).grid(row=row, column=1, sticky="ew")
-            else:
-                var = tk.StringVar()
-                entry = ttk.Entry(page, textvariable=var)
-                if kind == "password":
-                    entry.configure(show="*")
-                entry.grid(row=row, column=1, sticky="ew")
-            self.vars[name] = var
-        return page
-
-    # -- settings --------------------------------------------------------
     def _load_into_widgets(self) -> None:
-        wifi = self._read_wifi_settings()
-        for name, var in self.vars.items():
-            value = wifi.get(name, getattr(self.cfg, name, ""))
-            if isinstance(var, tk.BooleanVar):
-                var.set(bool(value))
-            else:
-                var.set("" if value is None else str(value))
+        self.vars["dvi_mode"].set(self.settings.dvi_mode)
+        self.vars["dvi_invert_diffpairs"].set(str(self.settings.dvi_invert_diffpairs))
 
-    def _collect(self) -> dict:
-        known = {f.name for f in fields(Config)}
-        return {n: v.get() for n, v in self.vars.items() if n in known}
+    def _current_settings(self) -> StudioSettings:
+        settings = StudioSettings()
+        settings.update(
+            {
+                "dvi_mode": self.vars["dvi_mode"].get(),
+                "dvi_invert_diffpairs": self.vars["dvi_invert_diffpairs"].get(),
+            }
+        )
+        return settings
 
-    @staticmethod
-    def _read_wifi_settings() -> dict[str, str]:
-        if not DEVICE_SECRETS.exists():
-            return {}
+    def save_form_settings(self) -> bool:
         try:
-            tree = ast.parse(DEVICE_SECRETS.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError):
-            return {}
-        values: dict[str, str] = {}
-        wanted = {"WIFI_SSID": "wifi_ssid", "WIFI_PASS": "wifi_pass"}
-        for node in tree.body:
-            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-                continue
-            target = node.targets[0]
-            if not isinstance(target, ast.Name) or target.id not in wanted:
-                continue
-            try:
-                value = ast.literal_eval(node.value)
-            except (ValueError, TypeError):
-                continue
-            if isinstance(value, str):
-                values[wanted[target.id]] = value
-        return values
-
-    def _save_wifi_settings(self) -> None:
-        ssid = str(self.vars["wifi_ssid"].get()).strip()
-        password = str(self.vars["wifi_pass"].get())
-        if not ssid:
-            raise ValueError("Wi-Fi SSID cannot be blank")
-        if not DEVICE_SECRETS.exists():
-            server_ip = next(
-                (
-                    address for address in local_addresses()
-                    if address != "127.0.0.1" and not address.startswith("172.")
-                ),
-                "127.0.0.1",
-            )
-            text = (
-                "# Local device credentials - git-ignored, never uploaded.\n"
-                f"WIFI_SSID = {ssid!r}\n"
-                f"WIFI_PASS = {password!r}\n"
-                f"SERVER_IP = {server_ip!r}\n"
-                f"SERVER_PORT = {self.cfg.port}\n"
-                "DEVICE_ID = 'pico-dvi-01'\n"
-                "GITHUB_USER = 'AntwerpDesignsIonity'\n"
-                "GITHUB_REPO = 'pico-dvi-art-server'\n"
-                "GITHUB_BRANCH = 'main'\n"
-            )
-        else:
-            text = DEVICE_SECRETS.read_text(encoding="utf-8")
-            replacements = {"WIFI_SSID": ssid, "WIFI_PASS": password}
-            for key, value in replacements.items():
-                line = f"{key} = {value!r}"
-                pattern = rf"(?m)^{key}\s*=.*$"
-                text = (
-                    re.sub(pattern, line, text)
-                    if re.search(pattern, text)
-                    else text.rstrip() + "\n" + line + "\n"
-                )
-        DEVICE_SECRETS.write_text(text, encoding="utf-8")
-
-    def save_settings(self) -> bool:
-        candidate = Config.load()
-        try:
-            candidate.update(self._collect())
-            candidate.validate()
-            self._save_wifi_settings()
-        except (ValueError, TypeError) as exc:
+            settings = self._current_settings()
+            save_settings(settings)
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Invalid setting", str(exc))
             return False
-
-        payload = candidate.as_dict()
-        payload.pop("extra", None)
-        (REPO / "pc_server" / "config.json").write_text(
-            json.dumps(payload, indent=2), encoding="utf-8"
-        )
-        self.cfg = candidate
-        self._load_into_widgets()
+        self.settings = settings
         self.log(
-            f"Settings saved. Panel {self.cfg.dvi_mode} "
-            f"-> {self.cfg.width}x{self.cfg.height} framebuffer."
+            "Settings saved: "
+            f"mode={self.settings.dvi_mode}, "
+            f"polarity={self.settings.dvi_invert_diffpairs}."
         )
-        if self.server is not None:
-            self.log("Restarting server so the new settings take effect.")
-            self.stop_server()
-            self.start_server()
         return True
 
-    # -- server ----------------------------------------------------------
-    def toggle_server(self) -> None:
-        if self.server is None:
-            self.start_server()
-        else:
-            self.stop_server()
-
-    def start_server(self) -> None:
-        if self.server is not None:
-            return
-        try:
-            self.cfg = Config.load()
-        except ValueError as exc:
-            messagebox.showerror("Invalid configuration", str(exc))
-            return
-        ensure_firewall_rule(self.cfg.port, self.log)
-        self.server = ArtServer(self.cfg)
-        self.server_thread = threading.Thread(
-            target=self._serve, name="art-server", daemon=True
-        )
-        self.server_thread.start()
-        self.btn_server.configure(text="Stop control server")
-
-    def _serve(self) -> None:
-        srv = self.server
-        try:
-            srv.serve_forever()
-        except (OSError, RuntimeError) as exc:
-            self.logq.put(f"[!] server stopped: {exc}\n")
-        finally:
-            if self.server is srv:
-                self.server = None
-
-    def stop_server(self) -> None:
-        srv = self.server
-        if srv is None:
-            return
-        srv._stop.set()
-        # Unblock the accept() loop by connecting to ourselves.
-        try:
-            with socket.create_connection(("127.0.0.1", self.cfg.port), timeout=1):
-                pass
-        except OSError:
-            pass
-        if self.server_thread is not None:
-            self.server_thread.join(timeout=4)
-        self.server = None
-        self.btn_server.configure(text="Start control server")
-        self.log("Control server stopped.")
-
-    # -- device ----------------------------------------------------------
     def _tool_python(self) -> str | None:
-        python = PYTHON or _find_system_python()
-        if python is None:
-            messagebox.showerror(
-                "Python not found",
-                "Building/flashing firmware needs a system Python "
-                "installation (with CMake/Ninja/the Pico SDK). "
-                "Install Python 3.9+ and try again.",
-            )
-        return python
+        python = _find_system_python()
+        if python is not None:
+            return python
+        messagebox.showerror(
+            "Python not found",
+            "A Python 3.9+ installation is required to run tools/build_firmware.py.",
+        )
+        return None
 
-    def build_and_flash(self) -> None:
-        if self._busy:
-            return
-        if not self.save_settings():
+    def build_firmware(self) -> None:
+        if self._busy or not self.save_form_settings():
             return
         python = self._tool_python()
         if python is None:
-            return
-        args = [python, str(REPO / "tools" / "build_firmware.py"), "--flash",
-                "--mode", self.cfg.dvi_mode, "--invert-diffpairs",
-                str(self.cfg.dvi_invert_diffpairs)]
-        self._run_tool(args, "firmware build + flash", release_usb=True)
-
-    def push_ota(self) -> None:
-        if self._busy:
-            return
-        if not self.save_settings():
-            return
-        python = self._tool_python()
-        if python is None:
-            return
-        srv = self.server
-        clients = []
-        if srv is not None:
-            with srv._clients_lock:
-                clients = list(srv._clients)
-        if self.usb.connected or self.usb.port:
-            args = [
-                python, str(REPO / "tools" / "build_firmware.py"), "--flash",
-                "--mode", self.cfg.dvi_mode,
-                "--invert-diffpairs", str(self.cfg.dvi_invert_diffpairs),
-            ]
-            self._run_tool(args, "OTA build + USB flash", release_usb=True)
-            return
-        if not clients:
-            messagebox.showinfo(
-                "No Pico connected",
-                "Connect the Pico by USB or wait for its Wi-Fi connection.",
-            )
             return
         args = [
-            python, str(REPO / "tools" / "build_firmware.py"),
-            "--mode", self.cfg.dvi_mode,
-            "--invert-diffpairs", str(self.cfg.dvi_invert_diffpairs),
+            python,
+            str(REPO / "tools" / "build_firmware.py"),
+            "--mode",
+            self.settings.dvi_mode,
+            "--invert-diffpairs",
+            str(self.settings.dvi_invert_diffpairs),
         ]
-        self._run_tool(args, "OTA build", network_ota=True, python=python)
+        self._run_tool(args, "build firmware")
 
-    def _run_tool(
-        self,
-        args: list[str],
-        what: str,
-        *,
-        release_usb: bool = False,
-        network_ota: bool = False,
-        python: str | None = None,
-    ) -> None:
+    def flash_existing(self) -> None:
+        if self._busy or not self.save_form_settings():
+            return
+        python = self._tool_python()
+        if python is None:
+            return
+        args = [
+            python,
+            str(REPO / "tools" / "build_firmware.py"),
+            "--no-build",
+            "--flash",
+        ]
+        self._run_tool(args, "flash existing uf2")
+
+    def build_and_flash(self) -> None:
+        if self._busy or not self.save_form_settings():
+            return
+        python = self._tool_python()
+        if python is None:
+            return
+        args = [
+            python,
+            str(REPO / "tools" / "build_firmware.py"),
+            "--flash",
+            "--mode",
+            self.settings.dvi_mode,
+            "--invert-diffpairs",
+            str(self.settings.dvi_invert_diffpairs),
+        ]
+        self._run_tool(args, "build and flash")
+
+    def _run_tool(self, args: list[str], what: str) -> None:
         self._busy = True
-        self.btn_build.configure(state="disabled")
-        self.btn_ota.configure(state="disabled")
+        self._set_buttons("disabled")
+        self.status.configure(text=f"Running {what}...")
         self.log(f"--- {what} ---")
 
         def worker() -> None:
+            exit_code = 1
             try:
-                if release_usb:
-                    self.usb.pause()
                 proc = subprocess.Popen(
-                    args, cwd=str(REPO), stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, text=True, bufsize=1,
+                    args,
+                    cwd=str(REPO),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
                 )
+                assert proc.stdout is not None
                 for line in proc.stdout:
-                    self.logq.put(line)
-                code = proc.wait()
-                if code == 0 and network_ota:
-                    srv = self.server
-                    sent = (
-                        srv.broadcast_command({"action": "ota"})
-                        if srv is not None else 0
-                    )
-                    self.logq.put(f"[ota] reboot command sent to {sent} device(s)\n")
-                    if sent:
-                        flash_args = [
-                            python or PYTHON,
-                            str(REPO / "tools" / "build_firmware.py"),
-                            "--no-build",
-                            "--flash",
-                            "--mode",
-                            self.cfg.dvi_mode,
-                            "--invert-diffpairs",
-                            str(self.cfg.dvi_invert_diffpairs),
-                        ]
-                        proc = subprocess.Popen(
-                            flash_args, cwd=str(REPO), stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1,
-                        )
-                        for line in proc.stdout:
-                            self.logq.put(line)
-                        code = proc.wait()
-                self.logq.put(f"--- {what} finished (exit {code}) ---\n")
+                    self.logq.put(("log", line))
+                exit_code = proc.wait()
             except OSError as exc:
-                self.logq.put(f"[!] {what} failed: {exc}\n")
+                self.logq.put(("log", f"[!] {what} failed: {exc}\n"))
             finally:
-                if release_usb:
-                    self.usb.resume()
-                self._busy = False
-                self.btn_build.configure(state="normal")
-                self.btn_ota.configure(state="normal")
+                self.logq.put(("done", (what, exit_code)))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, name=f"tool-{what}", daemon=True).start()
 
-    # -- periodic --------------------------------------------------------
+    def _set_buttons(self, state: str) -> None:
+        for button in (self.btn_save, self.btn_build, self.btn_flash, self.btn_build_flash):
+            button.configure(state=state)
+
     def _tick(self) -> None:
         self._drain_log()
-        self._refresh_preview()
-        self._refresh_status()
         self.after(POLL_MS, self._tick)
 
     def _drain_log(self) -> None:
-        chunks = []
+        chunks: list[str] = []
         while True:
             try:
-                chunks.append(self.logq.get_nowait())
+                kind, payload = self.logq.get_nowait()
             except queue.Empty:
                 break
+            if kind == "log":
+                chunks.append(str(payload))
+            elif kind == "done":
+                what, exit_code = payload
+                self._busy = False
+                self._set_buttons("normal")
+                self.status.configure(
+                    text=(
+                        f"Finished {what}."
+                        if int(exit_code) == 0
+                        else f"{what.capitalize()} failed."
+                    )
+                )
+                chunks.append(f"--- {what} finished (exit {exit_code}) ---\n")
         if not chunks:
             return
         self.logbox.configure(state="normal")
         self.logbox.insert("end", "".join(chunks))
-        # Keep the pane bounded so a long run cannot eat all the memory.
         if int(self.logbox.index("end-1c").split(".")[0]) > 800:
             self.logbox.delete("1.0", "300.0")
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
 
-    def _refresh_preview(self) -> None:
-        srv = self.server
-        if srv is None:
-            return
-        try:
-            frame = srv.render_frame()
-            data = _to_ppm(frame)
-        except Exception as exc:  # a bad shader must not take the UI down
-            self.log(f"[!] preview failed: {exc}")
-            return
-        self._preview_img = tk.PhotoImage(data=data).zoom(PREVIEW_ZOOM)
-        self.preview.configure(image=self._preview_img)
+    def _refresh_device_status(self) -> None:
+        self.device_label.configure(text=describe_connected_device())
+        self.after(DEVICE_REFRESH_MS, self._refresh_device_status)
 
-    def _refresh_status(self) -> None:
-        srv = self.server
-        if srv is None:
-            self.status.configure(text="control server stopped")
-            self.device_label.configure(text="Control server stopped; Pico art continues locally.")
-            self.btn_server.configure(text="Start control server")
-            return
-
-        with srv._clients_lock:
-            clients = list(srv._clients)
-        addrs = ", ".join(local_addresses())
-        self.status.configure(
-            text=f"serving {self.cfg.width}x{self.cfg.height} @ {self.cfg.fps:g} fps "
-                 f"on {addrs}:{self.cfg.port}  |  {len(clients)} device(s)"
-        )
-
-        if not clients:
-            if self.usb.connected:
-                self.device_label.configure(
-                    text=f"Pico detected on {self.usb.port} for firmware flashing.\n"
-                         "Runtime artwork: waiting for the Pico's Wi-Fi connection."
-                )
-                return
-            self.device_label.configure(
-                text="No Pico connected over Wi-Fi. USB is used only for flashing."
-            )
-            return
-
-        lines = []
-        for session, _conn in clients:
-            with session.lock:
-                temp = session.local_temp_c
-                fps = session.client_fps
-                seen = time.time() - session.last_seen
-                who = f"{session.device_id or '?'} @ {session.address[0]}"
-                mcu = f"{temp:.1f}C" if temp is not None else "?"
-                lines.append(f"{who}   fw={session.fw_version}   mcu={mcu}")
-                lines.append(
-                    f"    device fps={fps if fps is not None else '?'}   "
-                    f"last heard {seen:.0f}s ago"
-                )
-        self.device_label.configure(text="\n".join(lines))
-
-    # -- misc ------------------------------------------------------------
     def log(self, message: str) -> None:
-        print(message.rstrip(), flush=True)
+        line = message if message.endswith("\n") else message + "\n"
+        self.logq.put(("log", line))
 
     def _on_close(self) -> None:
-        self.usb.stop()
-        self.stop_server()
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
         self.destroy()
-
-
-def _to_ppm(frame: np.ndarray) -> bytes:
-    """Binary PPM, which Tk's PhotoImage reads natively - no Pillow needed."""
-    rgb = np.ascontiguousarray(frame[:, :, :3].astype(np.uint8))
-    height, width = rgb.shape[:2]
-    return b"P6\n%d %d\n255\n" % (width, height) + rgb.tobytes()
 
 
 def main() -> None:
     global _INSTANCE_MUTEX
     if sys.platform == "win32":
         _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(
-            None, False, "Local\\PicoDviArtStudio"
+            None,
+            False,
+            "Local\\PicoDviFirmwareStudio",
         )
         if ctypes.windll.kernel32.GetLastError() == 183:
             ctypes.windll.user32.MessageBoxW(
                 None,
-                "Pico DVI Art Studio is already running.",
-                "Pico DVI Art Studio",
+                "Pico DVI Firmware Studio is already running.",
+                "Pico DVI Firmware Studio",
                 0x40,
             )
             return

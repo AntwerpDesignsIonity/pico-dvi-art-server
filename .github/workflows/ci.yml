@@ -16,14 +16,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install -r pc_server/requirements.txt
-
-      - name: Run the pipeline tests
+      - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
-      - name: Render throughput self-test
-        run: python pc_server/server.py --self-test 30 --temp-source none
-
-      - name: Byte-compile the Pico firmware
-        run: python -m compileall -q pico_firmware
+      - name: Byte-compile desktop tools
+        run: python -m compileall -q app tools

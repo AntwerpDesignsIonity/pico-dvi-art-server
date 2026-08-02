@@ -1,458 +1,102 @@
 # pico-dvi-art-server
 
-Infinite generative art computed directly on a **Raspberry Pi Pico 2 W** driving
-a **Waveshare PICO-DVI-LCD 10.1**. The native desktop application provides a
-preview plus Wi-Fi provisioning, firmware builds, flashing and OTA control.
+This repository keeps its historical name, but it is now a **Pico-only firmware workspace**.
 
-![preview frame](docs/preview.png)
+It builds and flashes the local-render **C firmware** for a **Raspberry Pi Pico 2 W** driving a **Waveshare PICO-DVI-LCD 10.1**. The Pico renders the generative artwork on-device; the desktop side exists only to build the UF2 and copy it over USB.
 
-* **Animated local colour field** implemented with inexpensive integer operations.
-* **On-panel status overlay** showing local-render/control state, IP address and
-  the actual RP2350 temperature.
-* **Rich desktop preview:** shader, retro and optional AI modes remain available
-  on the PC as previews; they are not transmitted to the panel.
-* **Local RP2350 rendering:** the Pico generates RGB565 artwork in its own back
-  buffer. Wi-Fi carries only tiny control and telemetry messages, never frames.
-* **Working Push OTA:** builds the selected C firmware, releases USB cleanly, enters
-  BOOTSEL, copies the UF2 and resumes local rendering. Network-only devices receive the
-  reboot command over TCP before the same UF2 copy.
-* Optional **AI preview mode** (rotating prompt template -> image API).
+## What this repository is about
 
----
+1. **Local art firmware** for the Pico 2 W and the DVI display carrier.
+2. **Desktop tooling** to configure the display mode, build the firmware, and flash it.
+3. **No server backend**: no desktop preview, no TCP control plane, and no runtime dependency on a PC once the UF2 has been flashed.
 
-## Current verified status (2026-08-01)
+## Quick start
 
-### Verified
+### Source launcher
 
-* The Pico 2 W enumerates as **COM5**, USB VID `2E8A`. The attached ESP device
-  uses VID `303A` and is never selected by the flashing tools.
-* The safe firmware builds and flashes automatically:
+Double-click **`START.bat`**.
 
-  ```powershell
-  python tools\build_firmware.py --mode 640x480 --invert-diffpairs 0 --clean --flash
-  ```
+It will:
 
-* The firmware uses **640x480p60 DVI** with a local **320x240 RGB565
-  framebuffer** doubled horizontally and vertically. Frames never cross Wi-Fi.
-* The standalone [PicoDVIArtStudio.exe](PicoDVIArtStudio.exe) starts the native
-  GUI and TCP server. Because it is a PyInstaller one-file application, first
-  launch can take roughly 20-30 seconds while it extracts; the launcher and
-  application child appearing as two processes is normal. Current SHA-256:
-  `D6C7DC3A9D555E086A98641225135ECE0936B2C3498E7089749D1BFF5D0462C2`.
-* The server has been verified listening on `192.168.124.4:5001`.
-* Windows Firewall has exactly one enabled inbound rule named
-  **Pico DVI Art Server**, allowing TCP port `5001` on all profiles. The app
-  checks this rule whenever the server starts and requests one UAC approval if
-  it must create it.
-* Wi-Fi credentials are editable in the GUI's **Network** tab. Saving writes
-  only to the ignored local credentials file. **Build + flash firmware** is
-  required before changed credentials are present on the Pico.
-* `temp_source = weather` reads current outdoor temperature from Open-Meteo
-  without an API key. Clock/date come from the PC. The MCU temperature appears
-  only after a connected Pico sends `TEMP` telemetry.
-* All **82 automated tests** pass.
+1. find Python 3.9+,
+2. install `pyserial` if needed,
+3. open the native **Pico DVI Firmware Studio**.
 
-### Still requiring physical verification
+### Manual build and flash
 
-* The local-render firmware and both polarity variants compile, but the actual
-  panel output still requires physical confirmation after flashing from this
-  merged worktree.
-* A solid red screen or coloured side lines indicate failed DVI lock or wrong
-  timing/polarity. Start with `640x480` and `invert_diffpairs=0`; try `1` only
-  if the screen remains solid. Then inspect carrier seating, cable/input and power.
-
----
-
-## Run it — one file, no questions
-
-Double-click **`PicoDVIArtStudio.exe`** for the packaged application, or
-**`START.bat`** to run the source version through an installed Python.
-
-<<<<<<< HEAD
-`START.bat` finds Python, installs missing dependencies the first time, then
-opens the native **Pico DVI Art Studio**. The packaged EXE already contains the
-Python runtime and application dependencies. In both cases the server runs
-inside the application; there is no browser or separate console server.
-=======
-It finds Python (installing nothing you already have), installs the dependencies the
-first time, then opens the native **Pico DVI Art Studio**. The optional control server runs inside the application; there is no browser,
-separate console server or port-selection step. The display does not require the
-application to remain open.
->>>>>>> agents/repo-check-and-save
-
-```
-PicoDVIArtStudio.exe
-  └── native GUI + art server + provisioning + build/flash/OTA controls
-
-START.bat
-  ├── finds Python 3.9+ (PATH, py launcher, or %LOCALAPPDATA%\Programs\Python)
-  ├── pip install -r pc_server/requirements.txt mpremote pyserial   (first run only)
-<<<<<<< HEAD
-  └── app/studio.py                 ← same application, run from source
-=======
-  └── app/studio.py                 ← desktop UI + preview + device control
->>>>>>> agents/repo-check-and-save
+```powershell
+python tools\build_firmware.py --flash --mode 640x480 --invert-diffpairs 1
 ```
 
-Select `retro`, `shader`, `ai` or `hybrid` under **Desktop preview**. The **Network** tab
-contains editable Wi-Fi SSID/password fields. Credentials are stored only in
-`pico_firmware/device_secrets.py`, which is git-ignored and never uploaded. Use
-**Build + flash firmware** after changing Wi-Fi settings. Only USB VID `2E8A`
-(Raspberry Pi) is ever selected; attached ESP boards are ignored.
+Safe default:
 
-If the panel glitches or stays one solid colour, use `640x480` and set
-**TMDS polarity** to `1`, then **Build + flash firmware** again. This is the
-carrier's documented differential-pair wiring; polarity `0` is diagnostic only.
+- `640x480`
+- `invert-diffpairs 1`
 
-Advanced use, if you ever want it:
+If the board does not reboot into BOOTSEL automatically, reconnect it while holding **BOOTSEL** and run the command again.
 
-```
-python tools/flash_pico.py --list      # identify every connected board, change nothing
-python tools/flash_pico.py             # interactive setup, prompts for credentials
-python tools/flash_pico.py --dry-run   # show the plan
-```
+## Repository structure
 
-### Building a standalone `.exe`
-
-`START.bat` needs Python installed. If you'd rather hand someone a single
-double-clickable file with no Python required, package the same app with
-PyInstaller:
-
-```
-pip install pyinstaller
-python -m PyInstaller --onefile --windowed --name "PicoDVIArtStudio" ^
-    --paths pc_server --distpath . app\studio.py
-```
-
-This produces `PicoDVIArtStudio.exe` at the repo root. The current release
-executable is committed to the repository so it can be downloaded and run
-directly. It must stay in this folder (next to `pico_firmware_c/`, `pico_firmware/`,
-`pc_server/`, `tools/`) since it uses the same relative paths as
-`app/studio.py`. Building/flashing firmware from the `.exe` still needs a
-system Python with CMake/Ninja/the Pico SDK installed; preview and control do not.
-
----
-
-## Architecture
-
-```
-<<<<<<< HEAD
-[ PC / local server ]  pc_server/server.py
-   |  1. InfiniteArtEngine        - swirling plasma, no repeat period
-   |  2. SwirlBorder              - animated colour frame
-   |  3. HUD                      - clock / date / OUT temp / MCU temp
-   |  4. RGB565 pack (153,600 B at 320x240)
-   +--> TCP :5001 --- Wi-Fi ---> [ Pico 2 W ]  pico_firmware_c/main.c
-                                     |  blits bytes into the DVI framebuffer
-                                     |  sends TEMP / STAT / HELLO back up
-                                     v
-                            [ Pico DVI LCD 10.1 ]
-=======
-[ Pico 2 W / RP2350 ]  pico_firmware_c/main.c
-   |  1. Integer local art renderer
-   |  2. RGB565 double buffer
-   |  3. PicoDVI PIO/TMDS scan-out on core 1
-   v
-[ Pico DVI LCD 10.1 ]
-
-[ PC app ] <-- tiny commands / telemetry over TCP :5001 --> [ Pico 2 W ]
->>>>>>> agents/repo-check-and-save
-
-[ Desktop app ] --BOOTSEL + UF2--> [ Pico 2 W C firmware ] --reboot
-```
-
-### Wire protocol
-
-PC to Pico, little-endian:
-
-| Packet  | Bytes                                                         |
-| ------- | ------------------------------------------------------------- |
-| Frame   | Legacy only; current local-render firmware drains and ignores it |
-| Command | `AA BB CC EE` + `uint32 length` + UTF-8 JSON `{"cmd": "ota"}`  |
-
-Pico to server, newline-terminated ASCII:
-
-```
-<<<<<<< HEAD
-HELLO <fw_version> <device_id>
-TEMP <celsius>            # RP2350 on-chip sensor -> the "MCU" HUD line
-=======
-HELLO <fw_version> <device_id> LOCAL
-TEMP <celsius>            # RP2350 on-chip sensor
->>>>>>> agents/repo-check-and-save
-STAT fps=<f> drops=<n>
-```
-
----
-
-## Cycle times — what changes, and how fast
-
-The panel's local pattern advances continuously from a frame counter. The richer
-cycles below apply only to the optional desktop preview.
-
-| Layer | Cycle | Where to change it |
-| --- | --- | --- |
-| Local art refresh | **~30 fps target** | `next_render` in C firmware |
-| Vortex swirl rotation | ~18 s per turn | `t * 0.35` in `math_shaders.render` |
-| Full hue wheel (whole artwork) | **~28 s** | `t * 0.021 * PHI` |
-| Plasma band motion | 7–12 s | `f1`…`f4` frequencies |
-| Swirl strength breathing | ~57 s | `_drift(t, 0, 0.11)` |
-| Zoom breathing | ~90 s | `_drift(t, 1, 0.07)` |
-| Border hue wheel | ~8.3 s | `t * 0.12` in `SwirlBorder.apply` |
-| Border comet lap | ~4.5 s / ~7.7 s (counter-rotating) | `t * 0.22`, `t * 0.13` |
-| MCU temperature uplink | **5 s** | `TELEMETRY_INTERVAL_S` |
-| Server temperature refresh | **10 min** | `temp_refresh_s` |
-| New AI preview (when enabled) | **90 s**, 3 s cross-fade | `ai_interval_s`, `ai_fade_s` |
-| OTA check | **on boot + hourly** | `OTA_ON_BOOT`, `OTA_CHECK_MINUTES` |
-| OTA on demand | ~2 s to reach the board (+ up to 5 min GitHub CDN lag) | `python pc_server/push_ota.py` |
-| Reconnect after server loss | 3 s, infinite retry | `RECONNECT_DELAY_S` |
-
-`--speed` and the preview controls affect the PC preview only. Change the constants
-inside `draw_local_art()` to tune the production panel animation.
-
----
-
-## Repository layout
-
-```
+```text
 pico-dvi-art-server/
-├── PicoDVIArtStudio.exe     # packaged native application
-├── START.bat                # source launcher (requires Python)
+├── START.bat
 ├── app/
-│   └── studio.py            # GUI + server owner + provisioning/flash/OTA controls
-├── .github/workflows/
-│   ├── release.yml          # auto-increments pico_firmware/version.json on push
-│   └── ci.yml               # tests + firmware byte-compile
-├── pico_firmware/           # flashed onto the Pico W
-│   ├── boot.py              # rollback check -> Wi-Fi -> GitHub OTA
-│   ├── ota.py               # GitHub updater with staging + rollback
-│   ├── main.py              # legacy MicroPython client (not used for this DVI carrier)
-│   ├── display_driver.py    # panel backends + offline animation
-│   ├── config.py            # tuning values (safe to publish)
-│   ├── device_secrets.example.py  # template -> copy to device_secrets.py
-│   └── version.json         # firmware version + file manifest
-├── pc_server/               # runs on your PC / home server
-│   ├── server.py            # desktop preview + control/telemetry server
-│   ├── math_shaders.py      # infinite swirl engine + swirling border
-│   ├── hud.py               # clock / date / temperature overlay
-│   ├── font5x7.py           # bitmap font
-│   ├── temperature.py       # weather / CPU / static temperature source
-│   ├── pixels.py            # RGB888 <-> RGB565 + framing
-│   ├── ai_prompts.py        # rotating AI prompt template + image fetcher
-│   ├── preview.py           # render PNGs without hardware
-│   ├── fake_pico.py         # virtual Pico W for end-to-end testing
-│   ├── push_ota.py          # tell every connected board to update now
-│   ├── config.example.json  # copy to config.json and edit
-│   └── requirements.txt
+│   ├── studio.py            # native desktop build/flash launcher
+│   └── studio_settings.py   # persisted local UI settings
+├── pico_firmware_c/
+│   ├── CMakeLists.txt
+│   ├── main.c               # local-render Pico firmware
+│   └── pico_sdk_import.cmake
 ├── tools/
-│   └── flash_pico.py        # USB detection + MicroPython install + provisioning
-└── tests/
-    ├── test_pipeline.py      # font, packing, shaders, HUD, socket round-trip
-    └── test_ota.py           # OTA staging / rollback against a stubbed GitHub
+│   ├── build_firmware.py    # build + flash entry point
+│   └── pico_device.py       # BOOTSEL / Raspberry Pi USB detection helpers
+├── tests/
+│   └── test_studio_settings.py
+└── .github/workflows/
+    └── ci.yml
 ```
 
----
+## Desktop application
 
-## 1. Run the server
+`app\studio.py` is a small Tkinter utility for:
 
-`START.bat` already does all of this. The commands below are the manual equivalent.
+1. selecting the DVI mode,
+2. selecting the TMDS polarity,
+3. building the UF2,
+4. flashing the Pico over USB.
+
+It does not host a server and does not stream frames.
+
+## Firmware notes
+
+- **640x480 mode** uses a **320x240 RGB565 framebuffer** that is doubled to the output timing.
+- **800x480 mode** uses a **400x240 RGB565 framebuffer**.
+- The panel artwork is generated locally in `pico_firmware_c\main.c`.
+- USB is the supported delivery path for firmware updates in this repository.
+
+## Toolchain requirements
+
+The build script will look for or fetch:
+
+- **CMake**
+- **Ninja**
+- **Arm GNU Toolchain (`arm-none-eabi-gcc`)**
+- **Pico SDK**
+- **PicoDVI**
+
+## Packaging the desktop launcher
+
+If you want a standalone Windows executable, package the current source version yourself:
 
 ```powershell
-pip install -r pc_server/requirements.txt
-
-# check the artwork without any hardware -> preview/frame_XXX.png
-python pc_server/preview.py --frames 6
-
-# start the optional preview/control server
-python pc_server/server.py
+pip install pyinstaller
+python -m PyInstaller --onefile --windowed --name "PicoDVIFirmwareStudio" app\studio.py
 ```
 
-The server prints its LAN addresses on start - put that IP into
-`pico_firmware/config.py` as `SERVER_IP`.
+## Summary
 
-Useful flags: `--fps 25`, `--source hybrid`, `--speed 0.6`, `--border 12`,
-`--byte-order big`, `--temp-source cpu`, `--no-hud`, `--self-test 60`.
+This is now a **formal, USB-first Pico DVI firmware repo**:
 
-Configuration precedence: defaults -> `pc_server/config.json`
-(copy `config.example.json`) -> `PICOART_*` environment variables -> CLI flags.
-
-```powershell
-copy pc_server\config.example.json pc_server\config.json
-$env:PICOART_FPS = "25"        # env override example
-```
-
-### Verify without hardware
-
-```powershell
-python pc_server/server.py --port 5099          # terminal 1
-python pc_server/fake_pico.py --port 5099 --frames 60 --save shot.png   # terminal 2
-```
-
-`fake_pico.py` exercises the legacy frame protocol and writes a received frame to
-PNG. The production C firmware advertises `LOCAL`, so the server sends it no frames.
-
----
-
-## 2. Flash the Pico 2 W (automatic)
-
-Use **Build + flash firmware** in the GUI. It saves the settings, builds the
-safe C/PicoDVI firmware, asks only Raspberry Pi VID `2E8A` to enter BOOTSEL,
-copies the UF2, and waits for the board to reboot.
-
-The equivalent command is:
-
-```powershell
-python tools\build_firmware.py --mode 640x480 --invert-diffpairs 1 --clean --flash
-```
-
-<<<<<<< HEAD
-The board shows a local checkered standby/status screen while Wi-Fi or the
-server is unavailable and keeps retrying. USB remains for explicit
-installation/recovery only; live art frames use Wi-Fi.
-=======
-   Edit it with your `WIFI_SSID`, `WIFI_PASS`, `SERVER_IP` and `GITHUB_*` values.
-   **It is git-ignored** — this repo has to be public for raw OTA to work, so the
-   password must never be committed. `config.py` reads it and falls back to harmless
-   placeholders when it is absent.
-2. Copy `boot.py`, `main.py`, `ota.py`, `display_driver.py`, `config.py`,
-   `device_secrets.py` and `version.json` to the board (Thonny, or
-   `mpremote cp pico_firmware/*.py :` — skip the `.example` file).
-3. Power the board from any USB adapter next to the panel.
-
-The production C firmware renders locally from boot and uses Wi-Fi only for
-telemetry and update/reboot commands. If the PC or network is down, the animation
-continues unchanged.
->>>>>>> agents/repo-check-and-save
-
-### Legacy MicroPython display backends
-
-`display_driver.py` probes, in order: a `picodvi.DVI` MicroPython module, a
-CircuitPython `picodvi.Framebuffer` + `framebufferio` combination, and finally a
-headless stub so you can validate the network path before the panel library is
-sorted. To use a different library, add a class exposing `buffer`, `show()` and
-`name` to `_BACKENDS`.
-
-If red and blue look swapped, flip the byte order on the server:
-`python pc_server/server.py --byte-order big`.
-
----
-
-## 3. OTA updates over GitHub
-
-1. Push this repo to GitHub (public, or the raw URLs will 404 — which is exactly why
-   `device_secrets.py` is git-ignored).
-2. Set `GITHUB_USER` / `GITHUB_REPO` / `GITHUB_BRANCH` in
-   `pico_firmware/device_secrets.py`.
-3. Edit any firmware file and push. `release.yml` bumps `version.json` and rewrites its
-   file manifest automatically.
-4. The board updates on its next boot, on its scheduled check
-   (`OTA_CHECK_MINUTES`, default hourly), or immediately when you run:
-
-```powershell
-python pc_server/push_ota.py                  # {"cmd": "ota"}
-python pc_server/push_ota.py --reboot         # {"cmd": "reboot"}
-```
-
-The running server picks the trigger file up within 2 seconds and broadcasts the
-command to every connected board.
-
-**Propagation delay.** `raw.githubusercontent.com` is fronted by a CDN with a hard
-`max-age=300`, so a freshly pushed commit takes **up to 5 minutes** to become visible
-to the board — no client-side header can bypass it. If you push and immediately run
-`push_ota.py`, the device may still see the old version; it will pick the new one up
-on its next hourly check, or just wait five minutes and trigger again.
-
-**Legacy MicroPython safety net.** Files are downloaded to `<name>.new` and validated (non-empty, not a
-GitHub 404 page) before anything is replaced. The version is then re-checked, so a
-publish landing mid-download can never mix old and new files. The old copies are kept
-as `<name>.bak` and an `ota.pending` marker is written. `main.py` calls
-`ota.mark_boot_ok()` after 20 successfully received frames, which clears the marker.
-If the board never gets that far, the next boot restores the backups, marks the bad
-version as `blocked` and refuses to install it again — push a higher version to
-recover.
-
-`config.py` and `device_secrets.py` are deliberately excluded from the manifest, so
-OTA never overwrites your Wi-Fi credentials.
-
----
-
-## 4. AI desktop preview (optional)
-
-`ai_prompts.py` holds the master prompt template plus the rotating variable lists
-(subject / style / palette / seed), so no two generations are alike:
-
-```powershell
-python pc_server/ai_prompts.py      # print a few sample prompts
-```
-
-To preview generated images instead of (or blended with) the shader:
-
-```powershell
-pip install pillow
-$env:OPENAI_API_KEY = "sk-..."
-python pc_server/server.py --source ai        # or: --source hybrid
-```
-
-`source=ai` cross-fades to each new image, `source=hybrid` keeps the swirl engine
-breathing over it. Generation happens on a background thread - a failed or slow API
-call never stalls the preview; the shader simply keeps running. Set
-`"ai_provider": "folder"` in `config.json` to cycle through local images in
-`art_cache/` instead of calling an API.
-
-**Never commit API keys** - they are read from the environment variable named by
-`ai_api_key_env`.
-
----
-
-## 5. Temperatures
-
-| HUD line | Source                                                                        |
-| -------- | ----------------------------------------------------------------------------- |
-| `OUT`    | server side: Open-Meteo current temperature (default), host CPU, or a constant |
-<<<<<<< HEAD
-| `MCU`    | the Pico's own RP2350 on-chip sensor (ADC4), sent up the stream every 5 s      |
-=======
-| `MCU`    | the Pico's RP2350 sensor, shown locally and sent as telemetry every 5 s        |
->>>>>>> agents/repo-check-and-save
-
-```json
-{ "temp_source": "weather", "latitude": 51.2194, "longitude": 4.4025 }
-```
-
-`temp_source` accepts `weather`, `cpu` (needs `pip install psutil`), `static` or
-`none`. Labels are configurable via `temp_label_server` / `temp_label_local`.
-The desktop preview shows `--` until its first reading; network loss never affects
-the on-device animation or local temperature display.
-
----
-
-## Tests
-
-```powershell
-python -m unittest discover -s tests -v
-python pc_server/server.py --self-test 60
-```
-
-The current suite contains **80 tests** covering font metrics, RGB565 packing,
-shader and retro-scene behavior, border/HUD placement, configuration, prompt
-rotation, socket framing/telemetry, and OTA staging/rollback failure cases.
-
----
-
-## Performance notes
-
-<<<<<<< HEAD
-* Rendering costs ~25 ms/frame at 400x240 on a modern desktop CPU (~40 fps headroom);
-  the border precomputes its geometry once and only touches edge pixels.
-* The safe 320x240 RGB565 mode is 153,600 bytes/frame. At 20 fps that is
-  ~24.6 Mbit/s before TCP/Wi-Fi overhead. The Pico W's CYW43439 is the real
-  limit; lower `fps` if the client stalls.
-* TCP back-pressure paces the stream automatically: a slow board simply receives
-  fewer frames instead of desynchronising.
-=======
-* The production renderer is integer-only and writes the RP2350's local RGB565
-  back buffer; no per-frame allocation or network transfer occurs.
-* Network traffic is limited to periodic temperature/status lines and occasional
-  OTA/reboot commands, so display smoothness is independent of Wi-Fi throughput.
-* Core 1 is dedicated to PicoDVI scan-out while core 0 renders and handles control.
->>>>>>> agents/repo-check-and-save
+- the **Pico** is the runtime target,
+- the **desktop** is only the build/flash tool,
+- the old **server backend has been removed**.
